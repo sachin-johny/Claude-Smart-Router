@@ -3,11 +3,32 @@
   "version": "1.0.0",
   "description": "Local proxy for Claude Code: routes requests between GLM/Claude by complexity and auto-clarifies ambiguous prompts.",
   "main": "router.js",
+  "bin": {
+    "claude-smart-router": "./router.js"
+  },
+  "files": [
+    "router.js",
+    "ROUTES.md",
+    "README.md",
+    "config.example.json",
+    ".env.example"
+  ],
   "scripts": {
-    "start": "node router.js"
+    "start": "node router.js",
+    "test": "node test/run-tests.js && node test/extra-probes.js"
   },
   "engines": {
     "node": ">=18"
   },
+  "keywords": [
+    "claude",
+    "claude-code",
+    "proxy",
+    "router",
+    "anthropic",
+    "glm",
+    "ollama",
+    "llm-routing"
+  ],
   "license": "MIT"
 }

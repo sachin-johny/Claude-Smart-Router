@@ -35,15 +35,29 @@ const crypto = require("crypto");
 const { Readable } = require("stream");
 
 // ---------------------------------------------------------------
+// Path resolution. Config, .env, and ROUTES.md are looked up in the
+// CURRENT WORKING DIRECTORY first (so an npm-installed CLI finds the
+// user's files where they run it), falling back to next to router.js
+// (repo checkout). Explicit env vars (ROUTER_CONFIG / ROUTER_ENV_PATH /
+// ROUTES_PATH) always win and skip the search.
+// ---------------------------------------------------------------
+
+function resolveFile(explicit, basename) {
+  if (explicit) return explicit;
+  const cwdPath = path.join(process.cwd(), basename);
+  if (fs.existsSync(cwdPath)) return cwdPath;
+  return path.join(__dirname, basename);
+}
+
+// ---------------------------------------------------------------
 // Optional .env loading (zero-dependency, dotenv-style).
-// If a .env file exists next to router.js (or at ROUTER_ENV_PATH),
-// its KEY=VALUE lines fill process.env — real environment variables
-// always win, so .env only supplies what isn't already set. This
-// keeps API keys out of config.json (and out of git).
+// Real environment variables always win, so .env only supplies what
+// isn't already set. This keeps API keys out of config.json (and out
+// of git).
 // ---------------------------------------------------------------
 
 (function loadDotEnv() {
-  const envPath = process.env.ROUTER_ENV_PATH || path.join(__dirname, ".env");
+  const envPath = resolveFile(process.env.ROUTER_ENV_PATH, ".env");
   let raw;
   try {
     raw = fs.readFileSync(envPath, "utf8");
@@ -64,19 +78,63 @@ const { Readable } = require("stream");
 // Config
 // ---------------------------------------------------------------
 
-const CONFIG_PATH = process.env.ROUTER_CONFIG || path.join(__dirname, "config.json");
-const ROUTES_PATH = process.env.ROUTES_PATH || path.join(__dirname, "ROUTES.md");
+const CONFIG_PATH = resolveFile(process.env.ROUTER_CONFIG, "config.json");
+const ROUTES_PATH = resolveFile(process.env.ROUTES_PATH, "ROUTES.md");
 
 function loadConfig() {
   if (!fs.existsSync(CONFIG_PATH)) {
+    const example = path.join(__dirname, "config.example.json");
     console.error(
       `\n[router] No config found at ${CONFIG_PATH}\n` +
-        `[router] Copy config.example.json to config.json and fill in your API keys.\n`
+        `[router] Copy config.example.json to config.json in this directory and fill in your API keys.\n` +
+        (CONFIG_PATH !== example && fs.existsSync(example)
+          ? `[router] (bundled example: ${example})\n`
+          : "")
     );
     process.exit(1);
   }
   const raw = fs.readFileSync(CONFIG_PATH, "utf8");
-  return JSON.parse(raw);
+  let cfg;
+  try {
+    cfg = JSON.parse(raw);
+  } catch (e) {
+    console.error(`\n[router] ${CONFIG_PATH} is not valid JSON: ${e.message}\n`);
+    process.exit(1);
+  }
+  validateConfig(cfg);
+  return cfg;
+}
+
+// Fail fast at startup with actionable messages rather than 500s on
+// the first request. Checks the structural essentials only — key
+// validity is the upstream's problem.
+function validateConfig(cfg) {
+  const problems = [];
+  if (!cfg || typeof cfg !== "object") {
+    console.error("\n[router] config.json must be a JSON object.\n");
+    process.exit(1);
+  }
+  if (!cfg.routes || typeof cfg.routes !== "object" || Object.keys(cfg.routes).length === 0) {
+    problems.push('"routes" must be a non-empty object mapping tiers to models');
+  } else {
+    const sharedBaseUrl = cfg.baseUrl || cfg.defaults?.baseUrl;
+    for (const [name, route] of Object.entries(cfg.routes)) {
+      const r = typeof route === "string" ? { model: route } : route;
+      if (!r.model) problems.push(`routes.${name} is missing "model"`);
+      if (!r.baseUrl && !sharedBaseUrl) {
+        problems.push(`routes.${name} is missing "baseUrl" (directly or via top-level baseUrl/defaults.baseUrl)`);
+      }
+    }
+  }
+  if (!cfg.classifier || !cfg.classifier.model) {
+    problems.push('"classifier.model" is required (a cheap fast model to triage requests)');
+  }
+  if (problems.length) {
+    console.error(`\n[router] Invalid config at ${CONFIG_PATH}:`);
+    for (const p of problems) console.error(`[router]   - ${p}`);
+    console.error("");
+    process.exit(1);
+  }
 }
 
 // Normalize shorthand config forms:
@@ -106,11 +164,19 @@ function normalizeConfig(cfg) {
 let config = normalizeConfig(loadConfig());
 
 const PORT = process.env.PORT || config.port || 8787;
+// Default 127.0.0.1 — this proxy injects API keys into upstream requests,
+// so it must not be reachable from the network unless explicitly opened up
+// (set "host": "0.0.0.0" in config or HOST env var, ideally with routerToken).
+const HOST = process.env.HOST || config.host || "127.0.0.1";
 const CLARIFY_ENABLED = config.clarify !== false;
 const MIN_WORDS_TO_CLASSIFY = config.skipClassifyMinWords ?? 4;
 const ANTHROPIC_VERSION = config.anthropicVersion || "2023-06-01";
 const UPSTREAM_TIMEOUT_MS = config.upstreamTimeoutMs || 120_000;
 const MAX_SESSIONS = config.maxSessions || 500;
+// Reject /v1/messages bodies above this size (default 20 MB — generous
+// headroom over even very large Claude Code contexts) so a runaway client
+// can't exhaust memory. Configurable as maxBodyMb.
+const MAX_BODY_BYTES = Math.floor((config.maxBodyMb || 20) * 1024 * 1024);
 
 // Optional proxy auth: if routerToken is set in config, all requests
 // must include Authorization: Bearer <token> matching it.
@@ -165,7 +231,11 @@ const sessionBackend = new Map();
 // ---------------------------------------------------------------
 
 (function applyEnvOverrides() {
-  if (process.env.CLASSIFIER_API_KEY) config.classifier.apiKey = process.env.CLASSIFIER_API_KEY;
+  // config.classifier is validated at load, but stay defensive — this IIFE
+  // must never crash the process over a missing key.
+  if (process.env.CLASSIFIER_API_KEY && config.classifier) {
+    config.classifier.apiKey = process.env.CLASSIFIER_API_KEY;
+  }
   // Generic key for all routes first, then per-route vars on top (they win).
   if (process.env.ROUTE_API_KEY) {
     for (const routeCfg of Object.values(config.routes || {})) {
@@ -221,11 +291,24 @@ function buildTriagePrompt(userText, sysSnippet, contextSummary) {
 // Helpers
 // ---------------------------------------------------------------
 
-function readJsonBody(req) {
+function readJsonBody(req, maxBytes) {
   return new Promise((resolve, reject) => {
     let chunks = [];
-    req.on("data", (c) => chunks.push(c));
+    let total = 0;
+    let tooLarge = false;
+    req.on("data", (c) => {
+      if (tooLarge) return; // already rejecting; drain the rest
+      total += c.length;
+      if (maxBytes && total > maxBytes) {
+        tooLarge = true;
+        chunks = [];
+        reject(Object.assign(new Error("request body too large"), { statusCode: 413 }));
+        return;
+      }
+      chunks.push(c);
+    });
     req.on("end", () => {
+      if (tooLarge) return;
       try {
         const buf = Buffer.concat(chunks);
         resolve(buf.length ? JSON.parse(buf.toString("utf8")) : {});
@@ -664,6 +747,18 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  if (req.method === "GET" && req.url === "/health") {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(
+      JSON.stringify({
+        status: "ok",
+        uptimeSeconds: Math.floor(process.uptime()),
+        sessions: sessionBackend.size,
+      })
+    );
+    return;
+  }
+
   if (req.method !== "POST" || req.url !== "/v1/messages") {
     // Passthrough anything else to the default backend, best-effort.
     try {
@@ -678,7 +773,18 @@ const server = http.createServer(async (req, res) => {
       const bodyChunks = [];
       if (req.method !== "GET" && req.method !== "HEAD") {
         await new Promise((resolve, reject) => {
-          req.on("data", (c) => bodyChunks.push(c));
+          let total = 0;
+          let tooLarge = false;
+          req.on("data", (c) => {
+            if (tooLarge) return;
+            total += c.length;
+            if (total > MAX_BODY_BYTES) {
+              tooLarge = true;
+              reject(Object.assign(new Error("request body too large"), { statusCode: 413 }));
+              return;
+            }
+            bodyChunks.push(c);
+          });
           req.on("end", resolve);
           req.on("error", reject);
         });
@@ -714,18 +820,20 @@ const server = http.createServer(async (req, res) => {
         res.end(await upstream.text());
       }
     } catch (e) {
-      res.writeHead(502, { "content-type": "application/json" });
-      res.end(JSON.stringify({ error: e.message }));
+      const status = e.statusCode === 413 ? 413 : 502;
+      res.writeHead(status, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: e.statusCode === 413 ? `request body exceeds ${MAX_BODY_BYTES} bytes` : e.message }));
     }
     return;
   }
 
   let body;
   try {
-    body = await readJsonBody(req);
+    body = await readJsonBody(req, MAX_BODY_BYTES);
   } catch (e) {
-    res.writeHead(400, { "content-type": "application/json" });
-    res.end(JSON.stringify({ error: "invalid JSON body" }));
+    const status = e.statusCode === 413 ? 413 : 400;
+    res.writeHead(status, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: e.statusCode === 413 ? `request body exceeds ${MAX_BODY_BYTES} bytes` : "invalid JSON body" }));
     return;
   }
 
@@ -847,8 +955,9 @@ const server = http.createServer(async (req, res) => {
 // Startup
 // ---------------------------------------------------------------
 
-server.listen(PORT, () => {
-  console.log(`[router] listening on http://localhost:${PORT}`);
+server.listen(PORT, HOST, () => {
+  const displayHost = HOST === "0.0.0.0" || HOST === "::" ? "localhost" : HOST;
+  console.log(`[router] listening on http://${displayHost}:${PORT} (bind: ${HOST})`);
 
   // Log all configured routes
   for (const [name, route] of Object.entries(config.routes)) {
@@ -857,7 +966,7 @@ server.listen(PORT, () => {
 
   console.log(`[router] classifier -> ${config.classifier.model} @ ${config.classifier.baseUrl}`);
   console.log(`[router] clarify=${CLARIFY_ENABLED}`);
-  console.log(`[router] upstreamTimeout=${UPSTREAM_TIMEOUT_MS}ms maxSessions=${MAX_SESSIONS}`);
+  console.log(`[router] upstreamTimeout=${UPSTREAM_TIMEOUT_MS}ms maxSessions=${MAX_SESSIONS} maxBody=${(MAX_BODY_BYTES / (1024 * 1024)).toFixed(0)}MB`);
   console.log(`[router] tools.minComplexity=${TOOLS_MIN_COMPLEXITY}` +
     (TOOLS_FIXED_MODEL ? ` tools.model=${TOOLS_FIXED_MODEL}` : ""));
 
@@ -867,3 +976,33 @@ server.listen(PORT, () => {
   if (routesTemplate) console.log(`[router] routesTemplate=ROUTES.md (keyword mode)`);
   else console.log(`[router] routesTemplate=built-in (JSON mode)`);
 });
+
+// A second instance on the same port is almost always a stale process —
+// give the actionable hint instead of a bare stack trace.
+server.on("error", (e) => {
+  if (e.code === "EADDRINUSE") {
+    console.error(`\n[router] Port ${PORT} is already in use — another router instance running?\n`);
+    process.exit(1);
+  }
+  console.error(`[router] server error: ${e.message}`);
+  process.exit(1);
+});
+
+// Graceful shutdown: stop accepting new connections, let in-flight
+// streams finish, exit. Forces after 10s if something hangs.
+let shuttingDown = false;
+function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`\n[router] ${signal} received — shutting down...`);
+  server.close(() => {
+    console.log("[router] closed.");
+    process.exit(0);
+  });
+  setTimeout(() => {
+    console.error("[router] forced exit after 10s — some connections did not close.");
+    process.exit(1);
+  }, 10_000).unref();
+}
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));

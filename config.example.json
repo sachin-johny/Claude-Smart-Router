@@ -1,10 +1,12 @@
 {
   "port": 8787,
+  "host": "127.0.0.1",
   "clarify": true,
   "skipClassifyMinWords": 4,
   "anthropicVersion": "2023-06-01",
   "upstreamTimeoutMs": 120000,
   "maxSessions": 500,
+  "maxBodyMb": 20,
 
   "routerToken": null,
 

@@ -26,8 +26,18 @@ Zero npm dependencies — Node.js 18+ only (uses global `fetch`).
 
 ## Setup
 
+Install and run in any directory (config is read from where you run it):
+
+```bash
+npm install -g claude-smart-router
+claude-smart-router
+```
+
+Or straight from a checkout:
+
 ```bash
 cp config.example.json config.json
+node router.js
 ```
 
 Fill in `config.json`:
@@ -133,6 +143,20 @@ Set `ROUTER_ENV_PATH` if you want the env file somewhere other than next to
   entries are evicted once exceeded.
 - `tools.model` — force a specific model whenever tools are present,
   bypassing tier routing entirely.
+- `host` (default `127.0.0.1`) — address to bind. The proxy injects your
+  API keys into upstream requests, so it stays loopback-only unless you
+  deliberately set `0.0.0.0` (do that only together with `routerToken`).
+- `maxBodyMb` (default `20`) — request bodies larger than this are
+  rejected with `413`.
+- `GET /health` — lightweight liveness endpoint (uptime + session count),
+  handy for process managers and uptime checks.
+
+Config, `.env`, and `ROUTES.md` are resolved from the **current working
+directory** first, then next to `router.js` — so a global install finds
+your files wherever you run it. Explicit env vars (`ROUTER_CONFIG`,
+`ROUTER_ENV_PATH`, `ROUTES_PATH`) always win. Invalid configs (bad JSON,
+missing routes/model/baseUrl) fail at startup with a list of exactly
+what's wrong instead of erroring per-request later.
 
 ## Known limitations
 
@@ -143,8 +167,7 @@ Set `ROUTER_ENV_PATH` if you want the env file somewhere other than next to
   recent assistant replies, not the full conversation — usually enough to
   judge complexity, but very context-dependent requests may be misjudged.
 - Cost weights are logged, not enforced — there's no hard budget cutoff.
-- This is a small, single-file tool meant to be read and modified, not a
-  polished package.
+- Single-process; no clustering. Fine for a personal proxy's load.
 
 ## Changes from earlier version (fixes applied)
 
