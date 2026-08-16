@@ -84,12 +84,12 @@ const ROUTES_PATH = resolveFile(process.env.ROUTES_PATH, "ROUTES.md");
 function loadConfig() {
   if (!fs.existsSync(CONFIG_PATH)) {
     const example = path.join(__dirname, "config.example.json");
+    const lookedIn = [path.join(process.cwd(), "config.json"), path.join(__dirname, "config.json")];
     console.error(
-      `\n[router] No config found at ${CONFIG_PATH}\n` +
-        `[router] Copy config.example.json to config.json in this directory and fill in your API keys.\n` +
-        (CONFIG_PATH !== example && fs.existsSync(example)
-          ? `[router] (bundled example: ${example})\n`
-          : "")
+      `\n[router] No config found. Looked in:\n` +
+        lookedIn.map((p) => `[router]   - ${p}`).join("\n") +
+        `\n[router] Copy config.example.json to config.json in your working directory and fill in your API keys.\n` +
+        (fs.existsSync(example) ? `[router] (bundled example: ${example})\n` : "")
     );
     process.exit(1);
   }
