@@ -32,7 +32,137 @@ const http = require("http");
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
+const readline = require("readline");
 const { Readable } = require("stream");
+
+// ---------------------------------------------------------------
+// Key management: `claude-smart-router key set|list|remove`
+// Claude-Code-style — keys typed blind, stored OUTSIDE any project
+// directory in ~/.claude-smart-router/keys.json (0600), so no repo or
+// agent workspace ever holds them. Real env vars still win; .env
+// supplies what's neither in env nor the keystore.
+// ---------------------------------------------------------------
+
+const KEYSTORE_DIR = path.join(
+  process.env.USERPROFILE || process.env.HOME || ".",
+  ".claude-smart-router"
+);
+const KEYSTORE_PATH = path.join(KEYSTORE_DIR, "keys.json");
+const KEY_NAMES = ["route", "classifier", "router"];
+
+function readKeystore() {
+  try {
+    return JSON.parse(fs.readFileSync(KEYSTORE_PATH, "utf8")) || {};
+  } catch (_) {
+    return {};
+  }
+}
+
+function writeKeystore(keys) {
+  fs.mkdirSync(KEYSTORE_DIR, { recursive: true });
+  fs.writeFileSync(KEYSTORE_PATH, JSON.stringify(keys, null, 2) + "\n", {
+    mode: 0o600,
+    flag: "w",
+  });
+}
+
+// Prompt on the TTY (not the piped stdout) so the typed key never ends
+// up in captured output. Characters aren't echoed — this is a plain
+// readline with output muted, the same UX as every CLI "password:".
+function askHidden(question) {
+  return new Promise((resolve) => {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    rl.question(question, (answer) => {
+      rl.close();
+      resolve(answer.trim());
+    });
+    rl.output.write = () => {}; // mute echo
+  });
+}
+
+function maskKey(k) {
+  if (!k) return "(not set)";
+  if (k.length <= 8) return k[0] + "***";
+  return `${k.slice(0, 4)}...${k.slice(-4)}`;
+}
+
+function cmdKey(args) {
+  const sub = args[0];
+  if (sub === "set") {
+    const name = args[1];
+    if (!name || !KEY_NAMES.includes(name)) {
+      console.error(`Usage: claude-smart-router key set <${KEY_NAMES.join("|")}>\n` +
+        `  route       — key for all route tiers (ROUTE_API_KEY equivalent)\n` +
+        `  classifier  — key for the triage model (CLASSIFIER_API_KEY equivalent)\n` +
+        `  router      — token clients must present to use this proxy (ROUTER_TOKEN equivalent)`);
+      process.exit(1);
+    }
+    askHidden(`${name} key (input hidden): `).then((val) => {
+      if (!val) {
+        console.error("No input — nothing saved.");
+        process.exit(1);
+      }
+      const keys = readKeystore();
+      keys[name] = val;
+      writeKeystore(keys);
+      console.log(`Saved ${name} key to ${KEYSTORE_PATH} (visible as ${maskKey(val)})`);
+      process.exit(0);
+    });
+    return true;
+  }
+  if (sub === "list") {
+    const keys = readKeystore();
+    console.log(`Keystore: ${KEYSTORE_PATH}`);
+    for (const name of KEY_NAMES) console.log(`  ${name.padEnd(11)} ${maskKey(keys[name])}`);
+    process.exit(0);
+  }
+  if (sub === "remove") {
+    const name = args[1];
+    if (!name || !KEY_NAMES.includes(name)) {
+      console.error(`Usage: claude-smart-router key remove <${KEY_NAMES.join("|")}>`);
+      process.exit(1);
+    }
+    const keys = readKeystore();
+    if (!keys[name]) {
+      console.error(`No ${name} key stored.`);
+      process.exit(1);
+    }
+    delete keys[name];
+    writeKeystore(keys);
+    console.log(`Removed ${name} key.`);
+    process.exit(0);
+  }
+  console.error(
+    `Usage: claude-smart-router key <set|list|remove>\n` +
+    `  key set <name>      — type a key blind; stored in ${KEYSTORE_DIR}\n` +
+    `  key list            — show stored keys (masked)\n` +
+    `  key remove <name>   — delete one`
+  );
+  process.exit(1);
+}
+
+// Entry-point dispatch. Handled before config/.env so key commands work
+// with no config present. Anything else falls through to the server.
+const argv = process.argv.slice(2);
+if (argv[0] === "key") {
+  cmdKey(argv.slice(1));
+  return; // cmdKey exits on its own; never fall through to the server
+}
+if (argv[0] === "--help" || argv[0] === "-h") {
+  console.log(
+    `claude-smart-router — local complexity-routing proxy for Claude Code\n\n` +
+    `Usage:\n` +
+    `  claude-smart-router            start the proxy (reads config.json from cwd)\n` +
+    `  claude-smart-router key set <route|classifier|router>\n` +
+    `                                 store an API key in ~/.claude-smart-router/ (typed blind)\n` +
+    `  claude-smart-router key list   show stored keys (masked)\n` +
+    `  claude-smart-router key remove <name>\n\n` +
+    `Config lookup: ./config.json, then next to the installed router.js.\n` +
+    `Key lookup: env vars > keystore > .env\n` +
+    `Docs: README.md`
+  );
+  process.exit(0);
+}
 
 // ---------------------------------------------------------------
 // Path resolution. Config, .env, and ROUTES.md are looked up in the
@@ -50,11 +180,27 @@ function resolveFile(explicit, basename) {
 }
 
 // ---------------------------------------------------------------
-// Optional .env loading (zero-dependency, dotenv-style).
-// Real environment variables always win, so .env only supplies what
-// isn't already set. This keeps API keys out of config.json (and out
-// of git).
+// Env layering (zero-dependency, dotenv-style).
+// Precedence: real environment variables > ~/.claude-smart-router
+// keystore > .env. Keys typed via `key set` land in the keystore and
+// never need to live in a project directory at all.
 // ---------------------------------------------------------------
+
+// Keystore applies BEFORE .env so a stored key beats a placeholder left
+// in a project .env — and after real env, since it only fills vars that
+// are still undefined. Net precedence: env vars > keystore > .env.
+(function applyKeystore() {
+  const keys = readKeystore();
+  const map = { route: "ROUTE_API_KEY", classifier: "CLASSIFIER_API_KEY", router: "ROUTER_TOKEN" };
+  let applied = [];
+  for (const [name, envVar] of Object.entries(map)) {
+    if (keys[name] && process.env[envVar] === undefined) {
+      process.env[envVar] = keys[name];
+      applied.push(name);
+    }
+  }
+  if (applied.length) console.log(`[router] keystore supplied: ${applied.join(", ")}`);
+})();
 
 (function loadDotEnv() {
   const envPath = resolveFile(process.env.ROUTER_ENV_PATH, ".env");
@@ -68,7 +214,7 @@ function resolveFile(explicit, basename) {
     const m = line.match(/^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$/);
     if (!m) continue; // blank line or # comment
     const [, key, val] = m;
-    if (process.env[key] !== undefined) continue; // real env wins
+    if (process.env[key] !== undefined) continue; // real env / keystore win
     process.env[key] = val.replace(/^["']|["']$/g, "");
   }
   console.log(`[router] loaded env vars from ${envPath}`);
