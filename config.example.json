@@ -32,9 +32,9 @@
 
   "routes": {
     "super_easy": "glm-4.7-flash",
-    "easy": "glm-4.7-flashx",
+    "easy": "glm-4.7-flash",
     "medium": "glm-5",
-    "hard": "glm-5.2[1m]",
-    "super_hard": "glm-5.2[1m]"
+    "hard": "glm-5.2",
+    "super_hard": "glm-5.2"
   }
 }

@@ -43,16 +43,22 @@ you want different models or providers.
 Keys typed via `key set` are stored in `~/.claude-smart-router/keys.json`
 — outside every project directory, like Claude Code's own credentials —
 and take precedence over `.env`. `key list` shows what's stored (masked),
-`key remove <name>` deletes one.
+`key remove <name>` deletes one. Get the key from your z.ai account: the
+default tiers all point at `https://api.z.ai/api/anthropic`, and models
+are billed against that platform's balance.
 
-Or straight from a checkout:
+Or straight from a checkout — same flow, keys still come from the
+keystore:
 
 ```bash
-cp config.example.json config.json
 node router.js
 ```
 
-Fill in `config.json`:
+`config.json` is only for changing what the bundled defaults don't cover.
+Copy `config.example.json` to `config.json` in your working directory when
+you want different models or providers. API keys don't belong in it — they
+resolve from the keystore/env first; a per-route `apiKey` in config works
+as an explicit override. What it controls:
 
 - `classifier` — cheap/fast model used to triage every request (default:
   GLM's flash tier). Point this at Ollama (`"baseUrl": "http://localhost:11434"`)
@@ -78,12 +84,12 @@ You'll see something like:
 
 ```text
 [router] loaded routes template from ./ROUTES.md
-[router] listening on http://localhost:8787
+[router] listening on http://127.0.0.1:8787 (bind: 127.0.0.1)
 [router] super_easy -> glm-4.7-flash @ https://api.z.ai/api/anthropic
-[router] easy -> glm-4.7-flashx @ https://api.z.ai/api/anthropic
+[router] easy -> glm-4.7-flash @ https://api.z.ai/api/anthropic
 [router] medium -> glm-5 @ https://api.z.ai/api/anthropic
-[router] hard -> glm-5.2[1m] @ https://api.z.ai/api/anthropic
-[router] super_hard -> glm-5.2[1m] @ https://api.z.ai/api/anthropic
+[router] hard -> glm-5.2 @ https://api.z.ai/api/anthropic
+[router] super_hard -> glm-5.2 @ https://api.z.ai/api/anthropic
 [router] classifier -> glm-4.7-flash @ https://api.z.ai/api/anthropic
 [router] clarify=true
 [router] routesTemplate=ROUTES.md (keyword mode)
