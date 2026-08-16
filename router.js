@@ -334,6 +334,17 @@ const MAX_SESSIONS = config.maxSessions || 500;
 // can't exhaust memory. Configurable as maxBodyMb.
 const MAX_BODY_BYTES = Math.floor((config.maxBodyMb || 20) * 1024 * 1024);
 
+// Debug mode: per-request trace — prompt preview, classifier reply, and
+// the upstream URL/status the request actually went to. Enable with
+// "debug": true in config.json or DEBUG=1 env var.
+const DEBUG =
+  config.debug === true ||
+  ["1", "true", "yes"].includes((process.env.DEBUG || "").toLowerCase());
+
+function debugLog(...args) {
+  if (DEBUG) console.log("[router:debug]", ...args);
+}
+
 // Optional proxy auth: if routerToken is set in config, all requests
 // must include Authorization: Bearer <token> matching it.
 const ROUTER_TOKEN = process.env.ROUTER_TOKEN || config.routerToken || null;
@@ -594,12 +605,14 @@ async function callBackend(backend, body, { stream, timeoutMs } = {}) {
   }
 
   try {
+    debugLog(`upstream -> POST ${url} (model=${backend.model})`);
     const res = await fetch(url, {
       method: "POST",
       headers,
       body: JSON.stringify(body),
       signal: controller.signal,
     });
+    debugLog(`upstream <- HTTP ${res.status} from ${backend.model}`);
     return res;
   } finally {
     clearTimeout(timer);
@@ -745,6 +758,7 @@ async function triage(userText, systemPrompt, contextSummary) {
         temperature: 0,
         messages: [{ role: "user", content: prompt }],
       });
+      debugLog(`classifier (${config.classifier.model}) replied: ${JSON.stringify(resultText.slice(0, 200))}`);
       const complexity = extractComplexityKeyword(resultText);
       // No clarity/assumptions in keyword mode — just complexity
       return { complexity, clarity: "clear", assumptions: [] };
@@ -794,6 +808,7 @@ async function triage(userText, systemPrompt, contextSummary) {
 
   try {
     const raw = await callClassifier(triageBody);
+    debugLog(`classifier (${config.classifier.model}) replied: ${JSON.stringify(raw.slice(0, 300))}`);
     const cleaned = raw.replace(/^```json\s*|^```\s*|```$/gm, "").trim();
     const parsed = JSON.parse(cleaned);
     const complexity = COMPLEXITY_LEVELS.includes(parsed.complexity)
@@ -830,6 +845,7 @@ function extractComplexityKeyword(text) {
 // ---------------------------------------------------------------
 
 function appendClarificationNote(messages, userIndex, assumptions) {
+  debugLog(`clarify: appending ${assumptions.length} assumption(s) to user message #${userIndex}`);
   const note =
     "\n\n[router auto-clarification — your request looked underspecified, " +
     "proceeding with these assumptions unless you say otherwise:\n" +
@@ -890,6 +906,13 @@ function resolveRoute(complexity) {
 // ---------------------------------------------------------------
 
 const server = http.createServer(async (req, res) => {
+  debugLog(`<- ${req.method} ${req.url}`);
+
+  // Dispatch on the path only — Claude Code appends query strings
+  // (e.g. /v1/messages?beta=true), and an exact-string match would
+  // silently dump those into the un-routed passthrough branch.
+  const pathname = (req.url || "").split("?")[0];
+
   // Proxy auth gate
   if (!checkAuth(req)) {
     res.writeHead(401, { "content-type": "application/json" });
@@ -915,7 +938,7 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  if (req.method !== "POST" || req.url !== "/v1/messages") {
+  if (req.method !== "POST" || pathname !== "/v1/messages") {
     // Passthrough anything else to the default backend, best-effort.
     try {
       const backend = resolveRoute("easy");
@@ -1003,6 +1026,12 @@ const server = http.createServer(async (req, res) => {
   // Detect if request includes tools (from alexrudloff/llmrouter)
   const hasTools = Array.isArray(body.tools) && body.tools.length > 0;
 
+  debugLog(
+    `request: session=${key.slice(0, 10)} messages=${(body.messages || []).length} ` +
+    `tools=${hasTools ? body.tools.length : 0} stream=${!!body.stream}`
+  );
+  debugLog(`last user turn: ${JSON.stringify((text || "(empty)").slice(0, 200))}`);
+
   // NOTE: when inheriting a decision from a prior turn (continuation or
   // short follow-up), we always build a *new* object with assumptions: [].
   // Two reasons:
@@ -1083,6 +1112,7 @@ const server = http.createServer(async (req, res) => {
     `[router] -> complexity=${decision.complexity} requested_model=${requestedModel || "n/a"} ` +
     `routed_model=${backend.model} cost_weight=${costWeight}`
   );
+  debugLog(`routing: ${JSON.stringify((text || "(no text)").slice(0, 80))} -> ${decision.complexity} -> ${backend.model} @ ${backend.baseUrl}`);
 
   try {
     const upstream = await callBackend(backend, body, { stream: !!body.stream });
@@ -1127,6 +1157,7 @@ server.listen(PORT, HOST, () => {
 
   console.log(`[router] classifier -> ${config.classifier.model} @ ${config.classifier.baseUrl}`);
   console.log(`[router] clarify=${CLARIFY_ENABLED}`);
+  console.log(`[router] debug=${DEBUG ? "on (per-request trace)" : "off (set debug:true in config or DEBUG=1)"}`);
   console.log(`[router] upstreamTimeout=${UPSTREAM_TIMEOUT_MS}ms maxSessions=${MAX_SESSIONS} maxBody=${(MAX_BODY_BYTES / (1024 * 1024)).toFixed(0)}MB`);
   console.log(`[router] tools.minComplexity=${TOOLS_MIN_COMPLEXITY}` +
     (TOOLS_FIXED_MODEL ? ` tools.model=${TOOLS_FIXED_MODEL}` : ""));
