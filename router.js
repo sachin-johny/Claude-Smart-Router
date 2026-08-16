@@ -1131,6 +1131,36 @@ server.listen(PORT, HOST, () => {
   console.log(`[router] tools.minComplexity=${TOOLS_MIN_COMPLEXITY}` +
     (TOOLS_FIXED_MODEL ? ` tools.model=${TOOLS_FIXED_MODEL}` : ""));
 
+  // Key audit: a route without any resolvable key fails every request
+  // with an upstream 401 — better to name it at startup. Ollama
+  // backends (no auth) are exempt. Placeholder-looking values count as
+  // missing, since they'd 401 identically.
+  const PLACEHOLDER_RE = /^(PASTE_|your_|xxx+$|test-)/i;
+  const looksPlaceholder = (v) => !v || PLACEHOLDER_RE.test(v);
+  const keyIssues = [];
+  const routeKeySources = [];
+  for (const [name, route] of Object.entries(config.routes)) {
+    const isOllama = route.provider === "ollama" || (route.baseUrl || "").includes("11434");
+    if (isOllama) continue;
+    const hasKey = !looksPlaceholder(route.apiKey);
+    if (!hasKey) keyIssues.push(`route "${name}" (${route.model}) has no API key`);
+    routeKeySources.push([name, hasKey]);
+  }
+  const classifier = config.classifier;
+  if (classifier && !(classifier.provider === "ollama" || (classifier.baseUrl || "").includes("11434"))) {
+    if (looksPlaceholder(classifier.apiKey)) {
+      keyIssues.push(`classifier (${classifier.model}) has no API key`);
+    }
+  }
+  if (keyIssues.length) {
+    console.warn(`[router] WARNING: ${keyIssues.length} backend${keyIssues.length > 1 ? "s" : ""} will reject every request:`);
+    for (const issue of keyIssues) console.warn(`[router]   - ${issue}`);
+    console.warn(`[router] Fix: claude-smart-router key set route   (or ROUTE_API_KEY / .env / per-route apiKey in config)`);
+    if (keyIssues.some((i) => i.startsWith("classifier"))) {
+      console.warn(`[router]       claude-smart-router key set classifier`);
+    }
+  }
+
   if (ROUTER_TOKEN) console.log(`[router] proxyAuth=enabled`);
   else console.log(`[router] proxyAuth=disabled (set routerToken in config or ROUTER_TOKEN env to enable)`);
 
