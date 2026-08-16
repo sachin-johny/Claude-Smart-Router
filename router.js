@@ -228,25 +228,35 @@ const CONFIG_PATH = resolveFile(process.env.ROUTER_CONFIG, "config.json");
 const ROUTES_PATH = resolveFile(process.env.ROUTES_PATH, "ROUTES.md");
 
 function loadConfig() {
-  if (!fs.existsSync(CONFIG_PATH)) {
-    const example = path.join(__dirname, "config.example.json");
-    const lookedIn = [path.join(process.cwd(), "config.json"), path.join(__dirname, "config.json")];
-    console.error(
-      `\n[router] No config found. Looked in:\n` +
-        lookedIn.map((p) => `[router]   - ${p}`).join("\n") +
-        `\n[router] Copy config.example.json to config.json in your working directory and fill in your API keys.\n` +
-        (fs.existsSync(example) ? `[router] (bundled example: ${example})\n` : "")
-    );
-    process.exit(1);
+  let cfgPath = CONFIG_PATH;
+  let usingDefaults = false;
+  if (!fs.existsSync(cfgPath)) {
+    // Zero-config startup: fall back to the bundled example (GLM tiers,
+    // port 8787). A config.json dropped next to the cwd or the install
+    // always wins over this.
+    const bundled = path.join(__dirname, "config.example.json");
+    if (!fs.existsSync(bundled)) {
+      const lookedIn = [path.join(process.cwd(), "config.json"), path.join(__dirname, "config.json")];
+      console.error(
+        `\n[router] No config found. Looked in:\n` +
+          lookedIn.map((p) => `[router]   - ${p}`).join("\n") +
+          `\n[router] Copy config.example.json to config.json in your working directory and fill in your API keys.\n`
+      );
+      process.exit(1);
+    }
+    cfgPath = bundled;
+    usingDefaults = true;
   }
-  const raw = fs.readFileSync(CONFIG_PATH, "utf8");
+  const raw = fs.readFileSync(cfgPath, "utf8");
   let cfg;
   try {
     cfg = JSON.parse(raw);
   } catch (e) {
-    console.error(`\n[router] ${CONFIG_PATH} is not valid JSON: ${e.message}\n`);
+    console.error(`\n[router] ${cfgPath} is not valid JSON: ${e.message}\n`);
     process.exit(1);
   }
+  cfg.__usingDefaults = usingDefaults;
+  cfg.__configPath = cfgPath;
   validateConfig(cfg);
   return cfg;
 }
@@ -1104,6 +1114,11 @@ const server = http.createServer(async (req, res) => {
 server.listen(PORT, HOST, () => {
   const displayHost = HOST === "0.0.0.0" || HOST === "::" ? "localhost" : HOST;
   console.log(`[router] listening on http://${displayHost}:${PORT} (bind: ${HOST})`);
+
+  if (config.__usingDefaults) {
+    console.log(`[router] using bundled default config (${config.__configPath}) — GLM tiers, port ${PORT}.`);
+    console.log(`[router] drop a config.json in ${process.cwd()} to customize.`);
+  }
 
   // Log all configured routes
   for (const [name, route] of Object.entries(config.routes)) {

@@ -26,7 +26,7 @@ Zero npm dependencies — Node.js 18+ only (uses global `fetch`).
 
 ## Setup
 
-Install and run in any directory (config is read from where you run it):
+Install and run in any directory:
 
 ```bash
 npm install -g claude-smart-router
@@ -34,6 +34,11 @@ claude-smart-router key set route        # paste your GLM key (input hidden)
 claude-smart-router key set classifier   # same key if classifier is GLM
 claude-smart-router
 ```
+
+With keys in the keystore and no `config.json` anywhere, the router
+starts on the **bundled default config** (GLM tiers, port 8787) — zero
+files needed. Drop a `config.json` in your working directory whenever
+you want different models or providers.
 
 Keys typed via `key set` are stored in `~/.claude-smart-router/keys.json`
 — outside every project directory, like Claude Code's own credentials —
