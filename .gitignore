@@ -1,0 +1,6 @@
+# Secrets — never commit these
+.env
+config.json
+
+# Test artifacts
+test/logs/

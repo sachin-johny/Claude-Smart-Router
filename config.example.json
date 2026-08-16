@@ -1,0 +1,38 @@
+{
+  "port": 8787,
+  "clarify": true,
+  "skipClassifyMinWords": 4,
+  "anthropicVersion": "2023-06-01",
+  "upstreamTimeoutMs": 120000,
+  "maxSessions": 500,
+
+  "routerToken": null,
+
+  "tools": {
+    "minComplexity": "medium",
+    "model": null
+  },
+
+  "costWeights": {
+    "super_easy": 0.05,
+    "easy": 0.15,
+    "medium": 0.40,
+    "hard": 0.70,
+    "super_hard": 1.00
+  },
+
+  "baseUrl": "https://api.z.ai/api/anthropic",
+  "apiKey": "YOUR_GLM_API_KEY",
+
+  "classifier": {
+    "model": "glm-4.7-flash"
+  },
+
+  "routes": {
+    "super_easy": "glm-4.7-flash",
+    "easy": "glm-4.7-flashx",
+    "medium": "glm-5",
+    "hard": "glm-5.2[1m]",
+    "super_hard": "glm-5.2[1m]"
+  }
+}
