@@ -15,6 +15,17 @@
     "model": null
   },
 
+  "repoMap": {
+    "enabled": true,
+    "root": "./",
+    "maxTokens": 2000,
+    "minComplexity": "medium",
+    "ttlMs": 10000,
+    "pinnedFiles": [],
+    "compactAfter": { "super_hard": 4, "hard": 5, "medium": 6 },
+    "writeToFile": null
+  },
+
   "costWeights": {
     "super_easy": 0.05,
     "easy": 0.15,

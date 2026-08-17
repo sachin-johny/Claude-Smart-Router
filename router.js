@@ -374,6 +374,92 @@ const LEGACY_COMPLEXITY_TO_TIER = {
 const TOOLS_MIN_COMPLEXITY = config.tools?.minComplexity || "medium";
 const TOOLS_FIXED_MODEL = config.tools?.model || null; // Override: force a specific model for tool calls
 
+// ---------------------------------------------------------------
+// Repository map (per-session project overview)
+// ---------------------------------------------------------------
+// Injects a compact file-tree + exports summary into the FIRST user
+// message of every request in a session, so the model knows what
+// project it's in without the user having to @-mention files.
+//
+// The Messages API is stateless: the client owns the history and
+// resends its clean copy every request, so a one-shot mutation would
+// be seen by exactly ONE model call. Instead the payload is FROZEN
+// per session at the first turn whose classified complexity clears
+// minComplexity, and the same frozen bytes are re-appended on every
+// subsequent request. Byte-identical re-injection means the injected
+// prefix never changes -> upstream prompt caching covers it, so later
+// turns pay cache-read price (~10%) for the map, not full price.
+//
+// The map cache itself is TTL-based (see REPO_MAP_TTL_MS); rebuilds
+// and POST /map/refresh affect only sessions frozen afterward —
+// freezing never rewrites a live session's bytes (that would break
+// the cache prefix on every turn the map changed).
+//
+// Config (config.json):
+//   "repoMap": {
+//     "enabled": true,            // default true
+//     "root": "./",               // default cwd; override via ROUTER_PROJECT_ROOT
+//     "maxTokens": 2000,          // ~4 chars/token, hard byte cap
+//     "minComplexity": "medium"   // skip until a turn classifies at/above this
+//   }
+const REPO_MAP_ENABLED = config.repoMap?.enabled !== false;
+const REPO_MAP_ROOT = process.env.ROUTER_PROJECT_ROOT || config.repoMap?.root || process.cwd();
+const REPO_MAP_MAX_TOKENS = config.repoMap?.maxTokens || 2000;
+// Gate on the CLASSIFIED (pre-tool-floor) complexity: Claude Code sends
+// tools on every request, so the tool floor would bump everything to
+// >= medium and a post-floor gate would never block real traffic.
+let REPO_MAP_MIN_COMPLEXITY = config.repoMap?.minComplexity || "medium";
+if (!COMPLEXITY_LEVELS.includes(REPO_MAP_MIN_COMPLEXITY)) {
+  console.warn(
+    `[router] repoMap: invalid minComplexity "${REPO_MAP_MIN_COMPLEXITY}" ` +
+    `(expected one of ${COMPLEXITY_LEVELS.join(", ")}) — falling back to "medium"`
+  );
+  REPO_MAP_MIN_COMPLEXITY = "medium";
+}
+// How long the cached map stays fresh before rebuild-on-access. VS Code
+// saves + Claude Code round-trips are almost always slower than this, so
+// by the time a new session starts the cache has already expired and the
+// rebuild picks up file additions / deletions. Trade-off: lower = fresher
+// but more walks; higher = fewer walks but staler after big edits.
+// 10s is the sweet spot — walks are <100ms for typical projects.
+const REPO_MAP_TTL_MS = config.repoMap?.ttlMs || 10_000;
+// Specific files to inject alongside the map. Useful for project context
+// that Claude Code doesn't auto-load (CLAUDE.md is already auto-loaded by
+// Claude Code, so don't duplicate it here). Each file is capped at
+// REPO_MAP_PINNED_MAX_BYTES to prevent budget blowup. Paths are relative
+// to REPO_MAP_ROOT; non-existent / unreadable files are silently skipped.
+const REPO_MAP_PINNED_FILES = Array.isArray(config.repoMap?.pinnedFiles)
+  ? config.repoMap.pinnedFiles.slice(0, 10)
+  : [];
+const REPO_MAP_PINNED_MAX_BYTES = 8 * 1024; // 8KB per file — generous for READMEs, tight enough to block runaway config
+
+// Auto-compact: after N *text* user turns (see countUserTextTurns — tool
+// round-trips don't count), inject the one-liner variant of the map
+// ("15 files, key: main.js, util.js, ...") instead of the full tree.
+// The router cannot trigger Claude Code's /compact (that's client-side);
+// this shrinks the router's OWN injected content once the model has
+// already Read the files it needs. Switching variants rewrites the
+// injected prefix exactly once (one cache break), then the compact
+// bytes are just as stable as the full ones.
+//
+// Threshold is frozen per session at freeze time (the session's classified
+// complexity on the turn that froze the map), so it can't flip-flop if a
+// later follow-up classifies differently. Set a tier to 0 to disable
+// compaction for it.
+const REPO_MAP_COMPACT_AFTER = Object.assign(
+  { super_hard: 4, hard: 5, medium: 6 },
+  config.repoMap?.compactAfter || {}
+);
+
+// Optional: write the map to a file on each rebuild, so the user can
+// @include it in CLAUDE.md for every-turn visibility. Trade-off: a
+// CLAUDE.md include is charged at full input price every turn, while
+// router injection sits inside the cached prefix (~10% per turn after
+// the first write). If you @include the file in CLAUDE.md, set
+// repoMap.enabled=false to avoid paying for the map twice.
+// Path is relative to REPO_MAP_ROOT.
+const REPO_MAP_WRITE_TO_FILE = config.repoMap?.writeToFile || null;
+
 // Cost weights per tier (from ulab-uiuc/LLMRouter cost-aware concept).
 // Used for logging only in this proxy — extend if you want budget enforcement.
 const COST_WEIGHTS = config.costWeights || {
@@ -494,9 +580,23 @@ function sessionKey(body) {
   return crypto.createHash("sha1").update(seed).digest("hex");
 }
 
+// Index of the session's FIRST user message — the exact predicate
+// sessionKey uses above. This is where the repo map is re-injected:
+// always the same message, always appended, so the mutated prefix is
+// byte-identical across turns (prompt-cache friendly). Injecting into
+// the LAST user message would move the map forward every turn.
+function firstUserMessageIndex(messages) {
+  return (messages || []).findIndex((m) => m.role === "user");
+}
+
 // LRU-ish cap on sessionBackend: evict the oldest entry when
 // the map exceeds MAX_SESSIONS to prevent unbounded memory growth.
 function setSession(key, decision) {
+  // Refresh recency: Map.set on an existing key does NOT move it, so
+  // without the delete a long-running active session could be evicted
+  // (insertion-order) while idle old ones survive — evicting it mid-
+  // conversation forces a re-freeze of its repo map (cache break).
+  sessionBackend.delete(key);
   sessionBackend.set(key, decision);
   if (sessionBackend.size > MAX_SESSIONS) {
     const oldest = sessionBackend.keys().next().value;
@@ -527,6 +627,26 @@ function extractLastUserTurn(messages) {
     return { text: "", isToolResultOnly: false, index: i };
   }
   return { text: "", isToolResultOnly: false, index: -1 };
+}
+
+// Count "real" user turns: user messages that carry non-empty text.
+// In Claude Code every tool_result round-trip is a role:"user" message,
+// so counting all user messages would make a super_hard agentic loop
+// cross its compactAfter threshold within ~2 tool calls — right when
+// the map is most useful. Tool-result-only messages don't count; a
+// message combining tool_result + typed text does (genuine interleaved
+// user input).
+function countUserTextTurns(messages) {
+  let n = 0;
+  for (const m of messages || []) {
+    if (m.role !== "user") continue;
+    if (typeof m.content === "string") {
+      if (m.content.trim()) n++;
+    } else if (Array.isArray(m.content)) {
+      if (m.content.some((b) => b.type === "text" && typeof b.text === "string" && b.text.trim())) n++;
+    }
+  }
+  return n;
 }
 
 // Build a short context summary from recent assistant messages.
@@ -844,6 +964,20 @@ function extractComplexityKeyword(text) {
 // Clarification note append
 // ---------------------------------------------------------------
 
+// Append text to a message, handling both content shapes (string or
+// block array). Always appends AFTER existing blocks: tool_result
+// blocks must come first in a user message, and a cache_control marker
+// on an earlier block is unaffected by blocks appended after it. Never
+// add our own cache_control — the client may already use all 4
+// breakpoints, and a 5th is a request-rejecting error.
+function appendTextToMessage(msg, text) {
+  if (typeof msg.content === "string") {
+    msg.content = msg.content + text;
+  } else if (Array.isArray(msg.content)) {
+    msg.content = [...msg.content, { type: "text", text: text.trim() }];
+  }
+}
+
 function appendClarificationNote(messages, userIndex, assumptions) {
   debugLog(`clarify: appending ${assumptions.length} assumption(s) to user message #${userIndex}`);
   const note =
@@ -852,12 +986,299 @@ function appendClarificationNote(messages, userIndex, assumptions) {
     assumptions.map((a) => `- ${a}`).join("\n") +
     "]";
 
-  const msg = messages[userIndex];
-  if (typeof msg.content === "string") {
-    msg.content = msg.content + note;
-  } else if (Array.isArray(msg.content)) {
-    msg.content = [...msg.content, { type: "text", text: note.trim() }];
+  appendTextToMessage(messages[userIndex], note);
+}
+
+// ---------------------------------------------------------------
+// Repository map: build + inject
+// ---------------------------------------------------------------
+// Walks REPO_MAP_ROOT once at startup, extracts top-level exported
+// names from source files via regex, formats as a compact text block.
+// No deps, no tree-sitter, no AST — good enough for the 90% case
+// (function/class/const signatures) across the common languages.
+//
+// Cache is TTL-based (REPO_MAP_TTL_MS); POST /map/refresh forces an
+// immediate rebuild. Rebuilds only affect sessions frozen afterward.
+
+const REPO_MAP_SKIP_DIRS = new Set([
+  "node_modules", ".git", ".svn", ".hg", "dist", "build", "out",
+  ".next", ".nuxt", ".vercel", ".cache", "coverage", ".turbo",
+  "__pycache__", ".pytest_cache", ".venv", "venv", "env", ".env",
+  ".idea", ".vscode", "target", "vendor", ".gradle", ".mypy_cache",
+  ".tox", ".eggs", "Pods", "Carthage", "DerivedData",
+]);
+const REPO_MAP_CODE_EXT = new Set([
+  ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs",
+  ".py", ".go", ".rs", ".java", ".kt", ".rb", ".php",
+  ".sh", ".bash", ".zsh",
+]);
+const REPO_MAP_MAX_EXPORTS = 8;
+const REPO_MAP_MAX_PATH_LEN = 96;
+const REPO_MAP_MAX_DEPTH = 8;
+const REPO_MAP_READ_BYTES = 64 * 1024; // exports are at the top; no need to scan whole files
+
+let repoMapCache = null;
+let repoMapBytes = 0;
+let repoMapFileCount = 0;
+let repoMapBuiltAt = 0; // epoch ms of last build; 0 = never
+
+function buildRepoMap() {
+  const root = path.resolve(REPO_MAP_ROOT);
+  const lines = [];
+  let budgetHit = false;
+  repoMapBytes = 0;
+  repoMapFileCount = 0;
+  const maxBytes = REPO_MAP_MAX_TOKENS * 4; // ~4 chars/token
+
+  function walk(dir, depth) {
+    if (repoMapBytes >= maxBytes) { budgetHit = true; return; }
+    if (depth > REPO_MAP_MAX_DEPTH) return;
+    let entries;
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch (_) { return; } // unreadable dir — skip silently
+    // Dirs first, then files, alphabetical within each group.
+    entries.sort((a, b) => {
+      if (a.isDirectory() && !b.isDirectory()) return -1;
+      if (!a.isDirectory() && b.isDirectory()) return 1;
+      return a.name.localeCompare(b.name);
+    });
+    for (const ent of entries) {
+      if (repoMapBytes >= maxBytes) { budgetHit = true; return; }
+      // Skip dotfiles (but allow the root itself, which we entered via path.resolve)
+      if (ent.name.startsWith(".") && ent.name !== ".") continue;
+      const full = path.join(dir, ent.name);
+      const rel = path.relative(root, full);
+      if (ent.isDirectory()) {
+        if (REPO_MAP_SKIP_DIRS.has(ent.name)) continue;
+        walk(full, depth + 1);
+      } else if (ent.isFile()) {
+        const ext = path.extname(ent.name).toLowerCase();
+        if (!REPO_MAP_CODE_EXT.has(ext)) continue;
+        if (rel.length > REPO_MAP_MAX_PATH_LEN) continue;
+        const exports = extractExports(full, ext);
+        // Indent paths by depth so the tree is skimmable.
+        const indent = "  ".repeat(Math.min(depth, 4));
+        const line = exports.length
+          ? `${indent}${rel}  ->  ${exports.join(", ")}`
+          : `${indent}${rel}`;
+        lines.push(line);
+        repoMapBytes += line.length + 1;
+        repoMapFileCount++;
+      }
+    }
   }
+
+  walk(root, 0);
+
+  if (!lines.length) {
+    repoMapCache = null;
+    repoMapBytes = 0;
+    repoMapFileCount = 0;
+    return null;
+  }
+
+  // If the byte budget cut the walk short, SAY SO — otherwise the model
+  // reads an alphabetically-truncated tree as the complete project.
+  const header = `Project map (root: ${path.basename(root) || root}, ${repoMapFileCount} files` +
+    (budgetHit ? " — TRUNCATED, more files not shown (maxTokens budget)" : "") + "):";
+  repoMapCache = `${header}\n${lines.join("\n")}`;
+  repoMapBytes = repoMapCache.length;
+  repoMapBuiltAt = Date.now();
+  writeRepoMapToFile();
+  return repoMapCache;
+}
+
+// Write the cached map to a file, so the user can @include it in
+// CLAUDE.md for every-turn visibility. Called after every rebuild.
+// No-op if writeToFile is not configured.
+function writeRepoMapToFile() {
+  if (!REPO_MAP_WRITE_TO_FILE || !repoMapCache) return;
+  try {
+    const fullPath = path.resolve(REPO_MAP_ROOT, REPO_MAP_WRITE_TO_FILE);
+    // Ensure parent directory exists (e.g. .router/repo-map.md).
+    fs.mkdirSync(path.dirname(fullPath), { recursive: true });
+    // Prepend a header comment so the file is self-documenting when
+    // the user opens it in their editor.
+    const header =
+      "<!-- Auto-generated by claude-smart-router. Do not edit. -->\n" +
+      "<!-- Run POST /map/refresh or restart the router to regenerate. -->\n" +
+      "<!-- To stop auto-generation, set repoMap.writeToFile=null in config.json. -->\n\n";
+    fs.writeFileSync(fullPath, header + repoMapCache + "\n");
+    debugLog(`repoMap: wrote to ${fullPath}`);
+  } catch (e) {
+    console.warn(`[router] repoMap: could not write to file ${REPO_MAP_WRITE_TO_FILE}: ${e.message}`);
+  }
+}
+
+// Regex extraction of top-level exported names. Each language gets a
+// small set of patterns — enough to surface the public surface area,
+// not enough to be a real parser. Misses are fine; the map is a hint.
+function extractExports(filePath, ext) {
+  let src;
+  try {
+    const fd = fs.openSync(filePath, "r");
+    const buf = Buffer.alloc(REPO_MAP_READ_BYTES);
+    const n = fs.readSync(fd, buf, 0, buf.length, 0);
+    fs.closeSync(fd);
+    src = buf.toString("utf8", 0, n);
+  } catch (_) { return []; }
+
+  const names = new Set();
+  const collect = (re) => {
+    let m;
+    while ((m = re.exec(src)) !== null) {
+      names.add(m[1]);
+      if (names.size >= REPO_MAP_MAX_EXPORTS) break;
+    }
+  };
+
+  if (ext === ".js" || ext === ".jsx" || ext === ".ts" || ext === ".tsx" || ext === ".mjs" || ext === ".cjs") {
+    collect(/export\s+(?:default\s+)?(?:async\s+)?function\s+(\w+)/g);
+    collect(/export\s+(?:default\s+)?class\s+(\w+)/g);
+    collect(/export\s+const\s+(\w+)/g);
+    collect(/^(?:async\s+)?function\s+(\w+)/gm);
+    collect(/^class\s+(\w+)/gm);
+  } else if (ext === ".py") {
+    collect(/^(?:async\s+)?def\s+(\w+)/gm);
+    collect(/^class\s+(\w+)/gm);
+  } else if (ext === ".go") {
+    collect(/^func\s+(?:\([^)]*\)\s+)?(\w+)/gm);
+    collect(/^type\s+(\w+)\s+/gm);
+  } else if (ext === ".rs") {
+    collect(/^(?:pub\s+)?fn\s+(\w+)/gm);
+    collect(/^(?:pub\s+)?struct\s+(\w+)/gm);
+    collect(/^(?:pub\s+)?enum\s+(\w+)/gm);
+  } else if (ext === ".java" || ext === ".kt") {
+    collect(/(?:class|interface|enum|record)\s+(\w+)/g);
+  } else if (ext === ".rb") {
+    collect(/^def\s+(?:self\.)?(\w+)/gm);
+    collect(/^(?:class|module)\s+(\w+)/gm);
+  } else if (ext === ".php") {
+    collect(/(?:^|\s)(?:function|class|interface)\s+(\w+)/g);
+  }
+  // .sh / .bash / .zsh: surface defined functions only.
+  else if (ext === ".sh" || ext === ".bash" || ext === ".zsh") {
+    collect(/^(\w+)\s*\(\s*\)\s*\{/gm);
+  }
+
+  return Array.from(names).slice(0, REPO_MAP_MAX_EXPORTS);
+}
+
+function getRepoMap() {
+  // TTL: if the cache is older than REPO_MAP_TTL_MS (or never built),
+  // rebuild before returning. This catches file additions / deletions
+  // without the overhead of a file watcher. The walk is <100ms for a
+  // typical project, so this is cheap relative to an LLM round-trip.
+  if (repoMapCache === null || Date.now() - repoMapBuiltAt > REPO_MAP_TTL_MS) {
+    return buildRepoMap();
+  }
+  return repoMapCache;
+}
+
+// Read pinned files at FREEZE time (not per-request). Pinned content
+// becomes part of the session's frozen bytes — re-reading it every turn
+// would let a mid-session edit change the injected prefix and break the
+// cache on every turn the file changed.
+// Returns an array of { path, content } objects; missing/unreadable files
+// are silently skipped. Each file is capped at REPO_MAP_PINNED_MAX_BYTES.
+function readPinnedFiles() {
+  if (!REPO_MAP_PINNED_FILES.length) return [];
+  const root = path.resolve(REPO_MAP_ROOT);
+  const out = [];
+  for (const rel of REPO_MAP_PINNED_FILES) {
+    // Resolve relative to root; refuse absolute paths outside root to
+    // avoid accidental exfiltration of system files via config.
+    const full = path.resolve(root, rel);
+    if (!full.startsWith(root + path.sep) && full !== root) {
+      console.warn(`[router] repoMap: skipping pinned file outside root: ${rel}`);
+      continue;
+    }
+    try {
+      const stat = fs.statSync(full);
+      if (!stat.isFile()) continue;
+      const fd = fs.openSync(full, "r");
+      const size = Math.min(stat.size, REPO_MAP_PINNED_MAX_BYTES);
+      const buf = Buffer.alloc(size);
+      fs.readSync(fd, buf, 0, size, 0);
+      fs.closeSync(fd);
+      const content = buf.toString("utf8");
+      const truncated = stat.size > REPO_MAP_PINNED_MAX_BYTES;
+      out.push({ path: rel, content, truncated, bytes: content.length });
+    } catch (e) {
+      // Missing pinned file is a config error worth flagging — the user
+      // explicitly asked for this file, so silent skip would be confusing.
+      console.warn(`[router] repoMap: could not read pinned file ${rel}: ${e.message}`);
+    }
+  }
+  return out;
+}
+
+// Build the injection blocks. All pure functions of the map text /
+// pinned files — rendered ONCE at freeze time and stored on the session
+// entry, so every subsequent request appends byte-identical bytes
+// (prompt-cache friendly; see the repoMap config block above).
+
+function buildRepoMapBlock(mapText) {
+  return (
+    "\n\n[router project map — files in this project, for context. " +
+    "Use Read/edit tools normally to inspect any of them; this is just " +
+    "an overview so you know the shape of the codebase.]\n" +
+    mapText +
+    "\n[/router project map]"
+  );
+}
+
+function buildPinnedBlock(pinnedFiles) {
+  if (!pinnedFiles.length) return "";
+  return (
+    "\n\n[router pinned files — loaded verbatim for context]\n" +
+    pinnedFiles.map((f) =>
+      `\n=== ${f.path}${f.truncated ? ` (truncated at ${REPO_MAP_PINNED_MAX_BYTES} bytes)` : ""} ===\n${f.content}`
+    ).join("\n") +
+    "\n[/router pinned files]"
+  );
+}
+
+// Pinned blocks rendered at different freeze times are separate string
+// allocations even when the content is identical — 500 sessions × 80KB
+// of pinned files would be ~40MB of duplicates. Interning keeps one
+// copy per distinct content (single-slot cache: pinned files change
+// rarely, and a miss only costs one extra render).
+let sharedPinned = { hash: null, block: "" };
+function internPinnedBlock(pinnedFiles) {
+  if (!pinnedFiles.length) return "";
+  const hash = crypto
+    .createHash("sha1")
+    .update(pinnedFiles.map((f) => f.path + "\x00" + f.content).join("\x01"))
+    .digest("hex");
+  if (sharedPinned.hash === hash) return sharedPinned.block;
+  const block = buildPinnedBlock(pinnedFiles);
+  sharedPinned = { hash, block };
+  return block;
+}
+
+// One-liner variant of the map, injected once the session crosses its
+// compactAfter threshold. Derived from the RAW map text (not the
+// rendered block): the header is skipped by "Project map" prefix — NOT
+// by indentation, which would silently drop root-level files (depth-0
+// lines have no indent).
+function buildCompactBlockText(mapText) {
+  const filePaths = [];
+  for (const line of mapText.split("\n")) {
+    if (line.startsWith("Project map")) continue;
+    // path-like token containing an extension, optionally followed by
+    // "  ->  export, names"
+    const m = line.match(/^\s*([^\[\n]+?\.[a-zA-Z0-9]+)\s*(?:->|$)/);
+    if (m) filePaths.push(m[1].trim());
+  }
+  const shown = filePaths.slice(0, 15);
+  const more = filePaths.length > 15 ? ` (+${filePaths.length - 15} more)` : "";
+  return (
+    `\n\n[router project map (compacted) — ${filePaths.length} files. ` +
+    `Key: ${shown.join(", ")}${more}. ` +
+    `Use Read to inspect any of them.]`
+  );
 }
 
 // ---------------------------------------------------------------
@@ -935,6 +1356,41 @@ const server = http.createServer(async (req, res) => {
         sessions: sessionBackend.size,
       })
     );
+    return;
+  }
+
+  // Inspect the current repo map (handy for debugging — confirm the
+  // router is seeing the files you expect, check the byte budget).
+  if (req.method === "GET" && pathname === "/map") {
+    if (!REPO_MAP_ENABLED) {
+      res.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
+      res.end("(repo map disabled — set repoMap.enabled=true in config.json)\n");
+      return;
+    }
+    const map = getRepoMap();
+    res.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
+    res.end((map || "(no source files found under " + REPO_MAP_ROOT + ")\n") + "\n");
+    return;
+  }
+
+  // Force a rebuild — call this after `git pull`, reorg, or any time the
+  // cached map has gone stale. No body needed.
+  if (req.method === "POST" && pathname === "/map/refresh") {
+    if (!REPO_MAP_ENABLED) {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ refreshed: false, reason: "repo map disabled" }));
+      return;
+    }
+    repoMapCache = null;
+    const map = buildRepoMap();
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({
+      refreshed: true,
+      root: REPO_MAP_ROOT,
+      files: repoMapFileCount,
+      bytes: repoMapBytes,
+      approxTokens: Math.ceil(repoMapBytes / 4),
+    }));
     return;
   }
 
@@ -1083,10 +1539,78 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
-  setSession(key, { complexity: classifiedComplexity, assumptions: decision.assumptions });
+  // Repo map freeze: on the first turn whose CLASSIFIED (pre-tool-floor)
+  // complexity clears the floor, render and freeze the payload on the
+  // session entry. Once frozen, TTL rebuilds and /map/refresh never touch
+  // it — rewriting a live session's bytes would break its cache prefix.
+  // Gating on the classified value (not the tool-floor-bumped one)
+  // matters: Claude Code sends tools on every request, so the bumped
+  // value is always >= medium and a post-floor gate would be decorative.
+  // If the map build returns null (empty repo), don't freeze anything —
+  // retry on a later qualifying turn; the TTL caps the walk frequency.
+  const hadSession = sessionBackend.has(key);
+  const priorSession = hadSession ? sessionBackend.get(key) : null;
+  let repoMapPayload = priorSession?.repoMap || null;
+  const repoMapFirstIdx = firstUserMessageIndex(body.messages);
+  if (
+    !repoMapPayload &&
+    REPO_MAP_ENABLED &&
+    repoMapFirstIdx >= 0 &&
+    !isToolResultOnly &&
+    COMPLEXITY_LEVELS.indexOf(classifiedComplexity) >= COMPLEXITY_LEVELS.indexOf(REPO_MAP_MIN_COMPLEXITY)
+  ) {
+    const mapText = getRepoMap();
+    if (mapText) {
+      const pinned = readPinnedFiles();
+      repoMapPayload = {
+        mapBlock: buildRepoMapBlock(mapText),
+        compactBlock: buildCompactBlockText(mapText),
+        pinnedBlock: internPinnedBlock(pinned),
+        compactTier: classifiedComplexity,
+      };
+      const injectedChars = repoMapPayload.mapBlock.length + repoMapPayload.pinnedBlock.length;
+      // Multiple user turns but no session entry = the entry was evicted
+      // or the router restarted mid-conversation. Re-freezing may change
+      // the injected bytes vs. what earlier turns carried (one cache
+      // break) — say so, so the blip is diagnosable.
+      const resumed = !hadSession && (body.messages || []).filter((m) => m.role === "user").length > 1;
+      console.log(
+        `[router] repoMap: froze session map (${injectedChars} chars` +
+        (resumed ? "; session entry was lost — re-froze" : "") +
+        ") on first qualifying turn"
+      );
+    }
+  }
+
+  setSession(key, {
+    complexity: classifiedComplexity,
+    assumptions: decision.assumptions,
+    repoMap: repoMapPayload,
+  });
 
   if (CLARIFY_ENABLED && decision.assumptions && decision.assumptions.length && index >= 0) {
     appendClarificationNote(body.messages, index, decision.assumptions);
+  }
+
+  // Re-inject the frozen payload into the session's FIRST user message
+  // on every request. The Messages API is stateless — the client resends
+  // its clean copy each turn — so one-shot injection would be seen by
+  // exactly one model call. Same frozen bytes + same target message =
+  // the mutated prefix is byte-identical across turns (cache-friendly).
+  // Past the compact threshold (counted in REAL user turns, not tool
+  // round-trips), the one-liner variant is injected instead: the switch
+  // rewrites the prefix exactly once, then the compact bytes are just
+  // as stable. Pinned files are never compacted.
+  if (repoMapPayload && repoMapFirstIdx >= 0) {
+    const threshold = REPO_MAP_COMPACT_AFTER[repoMapPayload.compactTier];
+    const useCompact = threshold && countUserTextTurns(body.messages) > threshold;
+    const block = (useCompact ? repoMapPayload.compactBlock : repoMapPayload.mapBlock) +
+      repoMapPayload.pinnedBlock;
+    appendTextToMessage(body.messages[repoMapFirstIdx], block);
+    debugLog(
+      `repoMap: re-injected ${useCompact ? "compact" : "full"} block ` +
+      `(${block.length} chars) into first user message #${repoMapFirstIdx}`
+    );
   }
 
   // Resolve backend: check for tools-fixed-model override, then normal routing
@@ -1197,6 +1721,47 @@ server.listen(PORT, HOST, () => {
 
   if (routesTemplate) console.log(`[router] routesTemplate=ROUTES.md (keyword mode)`);
   else console.log(`[router] routesTemplate=built-in (JSON mode)`);
+
+  // Repo map: build eagerly so the first request doesn't pay the walk
+  // cost, and so a misconfigured root surfaces at startup instead of
+  // silently producing an empty map on turn 1.
+  if (REPO_MAP_ENABLED) {
+    const map = buildRepoMap();
+    if (map) {
+      console.log(
+        `[router] repoMap=enabled root=${REPO_MAP_ROOT} files=${repoMapFileCount} ` +
+        `bytes=${repoMapBytes} (~${Math.ceil(repoMapBytes / 4)} tokens, every request, frozen per session, min=${REPO_MAP_MIN_COMPLEXITY})`
+      );
+      console.log(`[router] repoMap: GET /map to inspect, POST /map/refresh to rebuild (new sessions only)`);
+    } else {
+      console.log(`[router] repoMap=enabled but no source files found under ${REPO_MAP_ROOT} (map will be skipped)`);
+    }
+    // Early validation of pinned files: warn now if any are missing or
+    // unreadable, so the user discovers config typos at startup instead
+    // of after sending their first message and seeing nothing injected.
+    if (REPO_MAP_PINNED_FILES.length) {
+      const pinned = readPinnedFiles();
+      const found = new Set(pinned.map((p) => p.path));
+      const missing = REPO_MAP_PINNED_FILES.filter((p) => !found.has(p));
+      if (missing.length) {
+        console.warn(`[router] repoMap: pinned file(s) not found/readable: ${missing.join(", ")}`);
+      }
+      const pinnedBytes = pinned.reduce((n, f) => n + f.bytes, 0);
+      console.log(
+        `[router] repoMap: pinnedFiles=${pinned.length}/${REPO_MAP_PINNED_FILES.length}` +
+        (pinned.length ? ` (~${Math.ceil(pinnedBytes / 4)} tokens, max ${REPO_MAP_PINNED_MAX_BYTES}B each)` : "")
+      );
+    }
+    if (REPO_MAP_WRITE_TO_FILE) {
+      console.log(`[router] repoMap: writeToFile=${REPO_MAP_WRITE_TO_FILE} (use @include in CLAUDE.md for every-turn visibility)`);
+    }
+    const thresholds = Object.entries(REPO_MAP_COMPACT_AFTER)
+      .map(([k, v]) => `${k}=${v}`)
+      .join(" ");
+    console.log(`[router] repoMap: compactAfter=${thresholds} (real user turns; tool round-trips don't count)`);
+  } else {
+    console.log(`[router] repoMap=disabled (set repoMap.enabled=true in config.json to enable)`);
+  }
 });
 
 // A second instance on the same port is almost always a stale process —

@@ -54,6 +54,42 @@ keystore:
 node router.js
 ```
 
+### Packing, installing, uninstalling
+
+To try the package exactly as it would ship to npm — the tarball `npm pack`
+produces is byte-for-byte what `npm publish` uploads:
+
+```bash
+npm pack                       # -> claude-smart-router-<version>.tgz
+npm install -g ./claude-smart-router-1.2.3.tgz
+```
+
+You can also install straight from the checkout, no tarball needed:
+
+```bash
+npm install -g .
+```
+
+Upgrading is the same command re-run — npm replaces the previous version.
+To check what's actually inside a tarball before installing:
+
+```bash
+tar -tzf claude-smart-router-1.2.3.tgz
+```
+
+To remove it entirely:
+
+```bash
+npm uninstall -g claude-smart-router
+```
+
+Uninstalling only removes the package. Your keys
+(`~/.claude-smart-router/keys.json`), any project-local `config.json` /
+`.env`, and the `ANTHROPIC_BASE_URL` edit in `~/.claude/settings.json`
+survive — delete/undo those manually for a full cleanup. Also remember to
+fully restart VS Code (or any running Claude Code session) after
+uninstalling so it stops pointing at the dead proxy.
+
 `config.json` is only for changing what the bundled defaults don't cover.
 Copy `config.example.json` to `config.json` in your working directory when
 you want different models or providers. API keys don't belong in it — they
@@ -168,6 +204,9 @@ Set `ROUTER_ENV_PATH` if you want the env file somewhere other than next to
   rejected with `413`.
 - `GET /health` — lightweight liveness endpoint (uptime + session count),
   handy for process managers and uptime checks.
+- `GET /map` — inspect the current repo map (see below).
+- `POST /map/refresh` — rebuild the repo map cache. Call after `git pull`,
+  reorg, or any time the cached map has gone stale.
 
 Config, `.env`, and `ROUTES.md` are resolved from the **current working
 directory** first, then next to `router.js` — so a global install finds
@@ -177,11 +216,161 @@ your files wherever you run it. Explicit env vars (`ROUTER_CONFIG`,
 Invalid configs (bad JSON, missing routes/model/baseUrl) fail at startup
 with a list of exactly what's wrong instead of erroring per-request later.
 
+## Repo map (per-session project overview)
+
+The router injects a compact file-tree + exports summary into the first
+user message of every request in a session, so the model knows what project
+it's in without you having to `@`-mention files. This is the same idea as
+Aider's repo map or Cursor's `@Codebase`, but deliberately minimal: no tool
+interception (Claude Code's own Read/Edit tools handle file access). It
+exists for users who don't habitually `@`-mention files — if you do, you
+can disable it.
+
+**Why re-inject on every request?** The Messages API is stateless: Claude
+Code owns the conversation and resends its clean copy on every request. A
+one-shot injection would be seen by exactly one model call and then
+vanish. So instead the router **freezes** the map (plus pinned files) per
+session on the first turn whose classification clears `minComplexity`, and
+appends the *same frozen bytes* to the session's first user message on
+every subsequent request. Because the injected text never changes and
+always lands in the same message, it sits inside the prompt-cached prefix —
+after the first write, later turns pay cache-read price (~10% of base
+input) for the map, not full price.
+
+The map cache itself is TTL-based — no file watcher, because tokens are
+paid at injection time, not cache-update time. TTL rebuilds and
+`POST /map/refresh` only affect sessions **frozen afterward**; a live
+session's frozen bytes are never rewritten (that would break its cache
+prefix on every turn the map changed). If the router restarts or the
+session store evicts a live session (rare — see limitations below), the
+next qualifying turn re-freezes from the current map and the router logs
+it; that costs one cache break, after which the new bytes are stable again.
+
+```json
+"repoMap": {
+  "enabled": true,
+  "root": "./",
+  "maxTokens": 2000,
+  "minComplexity": "medium",
+  "ttlMs": 10000,
+  "pinnedFiles": [],
+  "compactAfter": { "super_hard": 4, "hard": 5, "medium": 6 },
+  "writeToFile": null
+}
+```
+
+- `enabled` (default `true`) — set `false` to turn the feature off entirely.
+- `root` (default `./`, override with `ROUTER_PROJECT_ROOT` env var) — the
+  directory to walk. Defaults to wherever you started the router.
+- `maxTokens` (default `2000`) — hard cap on map size. The walk stops as
+  soon as the serialized map crosses ~4 × this number of bytes, and the
+  header is marked `TRUNCATED` so the model knows the tree is partial.
+- `minComplexity` (default `medium`) — the map freezes on the first turn
+  *classified* at or above this level, so greetings ("hi") and quick
+  questions don't pay for it. Gating uses the classified complexity, not
+  the tool-floor-bumped one (Claude Code always sends tools, so the bumped
+  value is always ≥ medium and would make the gate meaningless).
+- `ttlMs` (default `10000`) — how long the cached map stays fresh before
+  being rebuilt on next access. Lower = fresher but more walks; higher =
+  fewer walks but staler.
+- `pinnedFiles` (default `[]`) — specific files injected verbatim alongside
+  the map, frozen into the session at the same moment. Useful for project
+  context Claude Code doesn't auto-load (note: `CLAUDE.md` IS auto-loaded
+  by Claude Code, so don't duplicate it here). Each file is capped at 8KB
+  to prevent budget blowup. Paths are relative to `root`; missing files
+  are skipped with a warning.
+
+```json
+"pinnedFiles": ["README.md", "AGENTS.md", "src/index.ts"]
+```
+
+`GET /map` shows you exactly what gets injected; `POST /map/refresh` forces
+an immediate rebuild (rarely needed thanks to TTL).
+
+What gets extracted: file paths (relative to `root`) plus top-level exported
+names — `function`, `class`, `const` for JS/TS; `def`/`class` for Python;
+`func`/`type` for Go; `fn`/`struct`/`enum` for Rust; equivalents for Java,
+Kotlin, Ruby, PHP, and shell. Skipped directories include `node_modules`,
+`.git`, `dist`, `build`, `.next`, `__pycache__`, `venv`, `target`, `vendor`,
+and similar. Files larger than 64KB are only scanned for exports in their
+first 64KB — exports are at the top, no need to read whole files.
+
+### Auto-compact (reclaim tokens after N user turns)
+
+After 4-6 *real* user turns, the full map is no longer useful — the model
+has already Read the files it needs — so the router switches to a one-liner
+variant ("15 files, key: main.js, util.js, ...") for the rest of the
+session:
+
+```json
+"compactAfter": { "super_hard": 4, "hard": 5, "medium": 6 }
+```
+
+- Thresholds count **text-bearing user turns only**. In Claude Code every
+  tool round-trip is a `user` message; counting those would compact a
+  super_hard agentic loop after ~2 tool calls, right when the map is most
+  useful. A message combining tool results + typed text does count
+  (genuine user input).
+- The tier is **frozen at freeze time** (the session's classified
+  complexity on the turn that froze the map), so the threshold can't
+  flip-flop if a follow-up classifies differently. Set a tier to `0` to
+  disable compaction for it.
+- Switching variants rewrites the injected prefix exactly **once** (a
+  single cache break at the crossing turn); the compact bytes are just as
+  stable afterward. Pinned files are never compacted.
+
+Note: this is NOT Claude Code's `/compact` — the router cannot trigger that
+(it's a client-side operation). This is the router shrinking its OWN
+injected content. For full conversation compaction, run `/compact` in
+Claude Code directly.
+
+### Writing the map to a file (CLAUDE.md integration)
+
+If you prefer the map to be a visible, version-controllable artifact — or
+if you want it included on every turn via CLAUDE.md's `@path` inclusion —
+set `writeToFile`:
+
+```json
+"writeToFile": ".router/repo-map.md"
+```
+
+The router writes the map to this file on every rebuild (startup, TTL
+expiry, or `POST /map/refresh`). To include it in every session's system
+context, add this line to your `CLAUDE.md`:
+
+```markdown
+@.router/repo-map.md
+```
+
+**Trade-off**: a CLAUDE.md include is charged at full input price on every
+turn, while router injection sits inside the cached prefix (~10% per turn
+after the first write). If you `@include` the file in CLAUDE.md, set
+`repoMap.enabled = false` to avoid paying for the map twice.
+
+When to use which:
+
+- **Router injection only** (default): cheapest per turn, map visible all
+  session. Best for most projects.
+- **CLAUDE.md inclusion only** (`enabled: false`, `writeToFile: "..."`):
+  version-controllable, visible to every tool that reads CLAUDE.md — but
+  full input price every turn. Worth it for small maps you want in git.
+- **Both** (not recommended): double token cost, no additional benefit.
+
 ## Known limitations
 
 - Session tracking is approximated by hashing your system prompt + first
   message. Two unrelated sessions with an identical system prompt and first
   message could share routing state. Fine for typical single-session use.
+- Repo-map re-injection assumes the upstream honors prompt caching. On a
+  non-caching Anthropic-compatible endpoint, the map is charged at full
+  input price on every request — lower `repoMap.maxTokens` if your
+  upstream doesn't cache.
+- If the router restarts or a live session is evicted from the session
+  store mid-conversation, the next qualifying turn re-freezes the repo
+  map from the current tree. If the tree changed, that rewrites the
+  injected bytes once (a single cache break). A tool-result-only turn
+  arriving right after the loss briefly carries no map until the next
+  text turn re-qualifies.
 - Classification looks at your latest message plus a short summary of
   recent assistant replies, not the full conversation — usually enough to
   judge complexity, but very context-dependent requests may be misjudged.
@@ -231,6 +420,6 @@ A few correctness issues were found and fixed in this pass:
    proper complexity→route mapping (`easy`→`light`, `medium`+→`heavy`).
 
 Issues #1–#5 were fixed before this pass; #6 and #7 were found by the test
-suite (`node test/run-tests.js` — 74 assertions across JSON mode, keyword
+suite (`node test/run-tests.js` — 104 assertions across repo-map lifecycle, JSON mode, keyword
 mode, Ollama, fallbacks, env overrides, auth, and error paths; plus
 `node test/extra-probes.js` for gzip passthrough and concurrency).
