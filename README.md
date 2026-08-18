@@ -423,3 +423,24 @@ Issues #1–#5 were fixed before this pass; #6 and #7 were found by the test
 suite (`node test/run-tests.js` — 104 assertions across repo-map lifecycle, JSON mode, keyword
 mode, Ollama, fallbacks, env overrides, auth, and error paths; plus
 `node test/extra-probes.js` for gzip passthrough and concurrency).
+
+## Testing
+
+```bash
+npm test
+```
+
+This runs `test/run-tests.js` (the main e2e suite — boots the router against
+mock Anthropic- and Ollama-shaped backends and asserts on what actually got
+forwarded) followed by `test/extra-probes.js` (gzip header-stripping and a
+20-way concurrency smoke test). Both spawn `test/mock-backends.js`
+automatically; you don't run it directly.
+
+`test/latency-probe.js` is a separate, manual one-off — it hits the real
+z.ai endpoint with a live API key to compare per-tier latency and is not
+part of `npm test` or CI (it costs real request quota and needs a real key
+in `ROUTE_API_KEY`, the keystore, or `.env`):
+
+```bash
+node test/latency-probe.js glm-4.7 glm-5.2
+```
