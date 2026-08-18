@@ -445,6 +445,9 @@ in `ROUTE_API_KEY`, the keystore, or `.env`):
 node test/latency-probe.js glm-4.7 glm-5.2
 ```
 
+CI runs the full `npm test` suite on every push and PR across Node
+18/20/22 — see `.github/workflows/ci.yml`.
+
 ## License
 
 MIT — see [LICENSE](./LICENSE).
