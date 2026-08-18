@@ -11,7 +11,8 @@
     "ROUTES.md",
     "README.md",
     "config.example.json",
-    ".env.example"
+    ".env.example",
+    "LICENSE"
   ],
   "scripts": {
     "start": "node router.js",

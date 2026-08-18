@@ -444,3 +444,7 @@ in `ROUTE_API_KEY`, the keystore, or `.env`):
 ```bash
 node test/latency-probe.js glm-4.7 glm-5.2
 ```
+
+## License
+
+MIT — see [LICENSE](./LICENSE).
