@@ -3,4 +3,5 @@
 config.json
 
 # Test artifacts
-test/
+test/fixtures
+test/logs
