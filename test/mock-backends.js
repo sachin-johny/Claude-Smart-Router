@@ -111,11 +111,29 @@ function makeAnthropicServer() {
       const status = parseInt(readControl("TIER_STATUS", "200"), 10);
       if (body.stream) {
         res.writeHead(status, { "content-type": "text/event-stream" });
-        res.write(`event: message_start\ndata: {"type":"message_start"}\n\n`);
+        // Usage-bearing events shaped like the real Messages API, so the
+        // router's credit tracking can read tokens off streams:
+        // message_start carries input/cache tokens, the final
+        // message_delta carries output tokens.
+        res.write(
+          `event: message_start\ndata: ${JSON.stringify({
+            type: "message_start",
+            message: {
+              usage: { input_tokens: 100, cache_read_input_tokens: 40, output_tokens: 1 },
+            },
+          })}\n\n`
+        );
         res.write(
           `data: ${JSON.stringify({
             type: "content_block_delta",
             delta: { type: "text_delta", text: `reply-from-${body.model}` },
+          })}\n\n`
+        );
+        res.write(
+          `event: message_delta\ndata: ${JSON.stringify({
+            type: "message_delta",
+            delta: { stop_reason: "end_turn" },
+            usage: { output_tokens: 50 },
           })}\n\n`
         );
         res.write(`event: message_stop\ndata: {"type":"message_stop"}\n\n`);

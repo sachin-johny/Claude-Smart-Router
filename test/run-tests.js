@@ -128,15 +128,26 @@ async function startRouter(configFile, env = {}) {
   return waitReady(routerProc, "router", 10_000);
 }
 
+// SIGTERM first (lets the router flush credit state etc.), then hard
+// kill: a lingering process holds the port and every later suite's
+// router dies on EADDRINUSE — the #1 source of order-dependent flakes.
+async function stopProc(proc) {
+  const p = proc;
+  await new Promise((r) => {
+    const kill = setTimeout(() => {
+      try { p.kill("SIGKILL"); } catch (_) { /* already gone */ }
+      setTimeout(r, 200);
+    }, 1000);
+    p.on("exit", () => { clearTimeout(kill); r(); });
+  });
+}
+
 async function stopRouter() {
   if (!routerProc) return;
   const p = routerProc;
   routerProc = null;
   p.kill("SIGTERM");
-  await new Promise((r) => {
-    p.on("exit", r);
-    setTimeout(r, 2000);
-  });
+  await stopProc(p);
 }
 
 async function stopMock() {
@@ -1145,6 +1156,123 @@ async function runTests() {
       fs.writeFileSync(pinnedPath, original);
     }
   });
+
+  // ---------------- credits (GLM Coding Plan tracking) ----------------
+  console.log("\n== suite: credits ==");
+  {
+    // tier-medium bills deterministically: the mock reports 100 input
+    // tokens (non-stream) or 100 input + 40 cached (stream), so with
+    // {in:100, cached:0, out:0} every request costs exactly 1.0 credits
+    // at peak rate, 0.5 off-peak. Assertions are ranges that hold in
+    // both regimes; hint tests disable peakHint so time-of-day can't
+    // change which hint fires first.
+    const tierMult = { "tier-medium": { in: 100, cached: 0, out: 0 } };
+    const creditConfig = (name, extra = {}) => {
+      const stateFile = path.join(LOG_DIR, `credits-${name}.json`);
+      fs.rmSync(stateFile, { force: true });
+      const p = path.join(LOG_DIR, `config-credits-${name}.json`);
+      const c = buildConfig();
+      c.credits = {
+        caps: { fiveHour: 0.4, weekly: 100 },
+        warnPct: 80,
+        multipliers: tierMult,
+        // anchored 1h ago -> current cycle is 1h old, resets in ~167h
+        weeklyResetAnchor: new Date(Date.now() - 3600_000).toISOString(),
+        stateFile,
+        ...extra,
+      };
+      fs.writeFileSync(p, JSON.stringify(c, null, 2));
+      return { path: p, stateFile };
+    };
+    const creditsOf = async () =>
+      (await (await fetch(`http://localhost:${ROUTER_PORT}/credits`)).json());
+    const firstUserTextOf = (call) =>
+      typeof call.body.messages[0].content === "string"
+        ? call.body.messages[0].content
+        : call.body.messages[0].content.map((b) => b.text || "").join("");
+    const MSG = [{ role: "user", content: "build a small utility function" }];
+    // Pin the classifier reply: don't inherit whatever an earlier suite left
+    setReply(JSON.stringify({ complexity: "medium", clarity: "clear", assumptions: [] }));
+
+    await test("credits: non-streaming usage recorded in /credits", async () => {
+      const { path: cfgP } = creditConfig("ns", { hints: false, peakHint: false });
+      await startRouter(cfgP, { ROUTES_PATH: NO_ROUTES });
+      await post("/v1/messages", msgBody({ messages: MSG }));
+      const snap = await creditsOf();
+      ok(snap.enabled === true, "tracking enabled");
+      ok(snap.fiveHour.used >= 0.5 && snap.fiveHour.used <= 1.0, `5h usage from response usage (${snap.fiveHour.used})`);
+      ok(snap.weekly.used >= 0.5 && snap.weekly.used <= 1.0, `weekly usage tracks same event (${snap.weekly.used})`);
+      ok(snap.weekly.resetsInMin > 0 && snap.weekly.resetsInMin <= 60 * 24 * 7, "weekly reset within 7 days");
+      ok(typeof snap.peak.now === "boolean" && typeof snap.peak.changeInMin === "number", "peak state reported");
+      eq(snap.events, 1, "exactly one ledger event");
+      // The classifier call must NOT be billed (unknown model -> skipped)
+      await post("/v1/messages", msgBody({ messages: [{ role: "user", content: "and another thing entirely different" }] }));
+      const snap2 = await creditsOf();
+      eq(snap2.events, 2, "second tier call booked, classifier call not");
+      await stopRouter();
+    });
+
+    await test("credits: streaming usage recorded via SSE scan", async () => {
+      const { path: cfgP } = creditConfig("ss", { hints: false, peakHint: false });
+      await startRouter(cfgP, { ROUTES_PATH: NO_ROUTES });
+      const before = (await creditsOf()).fiveHour.used;
+      const r = await post("/v1/messages", msgBody({ messages: MSG, stream: true }));
+      ok(r.text.includes("message_delta"), "mock streamed usage events", r.text.slice(0, 120));
+      await new Promise((r2) => setTimeout(r2, 300)); // let the router-side 'end' fire
+      const after = (await creditsOf()).fiveHour.used;
+      const delta = +(after - before).toFixed(4);
+      ok(delta >= 0.5 && delta <= 1.0, `stream tokens booked (delta ${delta})`);
+      await stopRouter();
+    });
+
+    await test("credits: threshold hint injected once per session", async () => {
+      const { path: cfgP } = creditConfig("hint", { hints: true, peakHint: false });
+      await startRouter(cfgP, { ROUTES_PATH: NO_ROUTES });
+      clearLog();
+      const turns = [
+        MSG,
+        [...MSG, { role: "assistant", content: "ok" }, { role: "user", content: "continue" }],
+        [...MSG, { role: "assistant", content: "ok" }, { role: "user", content: "continue more" }],
+      ];
+      for (const messages of turns) await post("/v1/messages", msgBody({ messages }));
+      const calls = chatCalls();
+      eq(calls.length, 3, "three chat calls");
+      ok(!firstUserTextOf(calls[0]).includes("[router:"), "turn 1 has no hint (usage unknown yet)");
+      ok(firstUserTextOf(calls[1]).includes("5-hour GLM credit window"), "turn 2 carries the threshold hint");
+      eq(
+        (firstUserTextOf(calls[2]).match(/5-hour GLM credit window/g) || []).length,
+        0,
+        "turn 3 carries no repeat hint (client resends clean messages)"
+      );
+      await stopRouter();
+    });
+
+    await test("credits: state survives a router restart", async () => {
+      const { path: cfgP, stateFile } = creditConfig("persist", { hints: false, peakHint: false });
+      await startRouter(cfgP, { ROUTES_PATH: NO_ROUTES });
+      await post("/v1/messages", msgBody({ messages: MSG }));
+      const before = (await creditsOf()).fiveHour.used;
+      // Wait out the debounced save (3s). The shutdown flush can't be
+      // relied on here: on Windows, child.kill("SIGTERM") terminates the
+      // process outright without running signal handlers.
+      await new Promise((r) => setTimeout(r, 3600));
+      ok(fs.existsSync(stateFile), "state file written (debounced save)");
+      await stopRouter();
+      await startRouter(cfgP, { ROUTES_PATH: NO_ROUTES });
+      const after = (await creditsOf()).fiveHour.used;
+      eq(after, before, "5h usage identical after restart");
+      await stopRouter();
+    });
+
+    await test("credits: enabled=false disables tracking", async () => {
+      const { path: cfgP } = creditConfig("off", { enabled: false });
+      await startRouter(cfgP, { ROUTES_PATH: NO_ROUTES });
+      await post("/v1/messages", msgBody({ messages: MSG }));
+      const snap = await creditsOf();
+      eq(snap.enabled, false, "/credits reports disabled");
+      await stopRouter();
+    });
+  }
 
   // ---------------- misc ----------------
   await test("misc: GET / health check", async () => {

@@ -37,8 +37,25 @@
   "budgetMax": null,
   "budgetReject": false,
 
+  "credits": {
+    "enabled": true,
+    "plan": "lite",
+    "caps": { "fiveHour": 2000, "weekly": 10000 },
+    "weeklyResetAnchor": "2026-08-26T21:17:00+02:00",
+    "warnPct": 80,
+    "hints": true,
+    "peakHint": true,
+    "stateFile": "credits-state.json",
+    "multipliers": {
+      "glm-5.3": { "in": 6.9, "cached": 1.7, "out": 24 },
+      "glm-5-turbo": { "in": 5.7, "cached": 1.5, "out": 21 },
+      "glm-4.7": { "in": 4.6, "cached": 1.2, "out": 16 }
+    }
+  },
+
   "compactHintTurns": 15,
   "classifyCacheTtlMs": 60000,
+  "heuristic": true,
 
   "baseUrl": "https://api.z.ai/api/anthropic",
   "apiKey": "YOUR_GLM_API_KEY",

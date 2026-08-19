@@ -548,6 +548,344 @@ function setCachedClassification(cacheKey, result) {
 }
 
 // ---------------------------------------------------------------
+// GLM Coding Plan credit tracking (docs.z.ai/devpack/overview).
+//
+// Tracks REAL plan credits — computed from the usage object upstream
+// reports on every response, never estimated — against the two plan
+// windows:
+//   5-hour: sliding; credits replenish 5h after they were spent.
+//   weekly: anchored cycle; resets every 7 days from weeklyResetAnchor.
+// Off-peak hours bill at 0.5x (peak = Mon-Fri 14:00-18:00 SGT/UTC+8).
+//
+// Known blind spot: anything that bypasses the router (Z.AI MCP tools
+// like web search, other API clients) is invisible here — treat the
+// numbers as a lower bound on plan usage.
+// ---------------------------------------------------------------
+
+const CREDITS_CFG = config.credits || {};
+const CREDITS_ENABLED = CREDITS_CFG.enabled !== false;
+const PLAN_CAP_PRESETS = {
+  lite: { fiveHour: 2000, weekly: 10000 },
+  pro: { fiveHour: 12000, weekly: 60000 },
+  max: { fiveHour: 28000, weekly: 140000 },
+};
+const CREDIT_CAPS =
+  CREDITS_CFG.caps || PLAN_CAP_PRESETS[String(CREDITS_CFG.plan || "").toLowerCase()] || PLAN_CAP_PRESETS.lite;
+const CREDITS_WARN_PCT = CREDITS_CFG.warnPct ?? 80;
+const CREDITS_HINTS = CREDITS_CFG.hints !== false;
+const CREDITS_PEAK_HINT = CREDITS_CFG.peakHint !== false;
+
+// Credit multipliers per Z.AI docs (per 10k tokens). Config may override
+// or extend per model. glm-5.2/glm-5.1 alias 5.3: upstream auto-routes
+// those requests to 5.3, so they bill as 5.3.
+const DEFAULT_CREDIT_MODELS = {
+  "glm-5.3": { in: 6.9, cached: 1.7, out: 24 },
+  "glm-5.2": { in: 6.9, cached: 1.7, out: 24 },
+  "glm-5.1": { in: 6.9, cached: 1.7, out: 24 },
+  "glm-5-turbo": { in: 5.7, cached: 1.5, out: 21 },
+  "glm-4.7": { in: 4.6, cached: 1.2, out: 16 },
+};
+const CREDIT_MODELS = { ...DEFAULT_CREDIT_MODELS, ...(CREDITS_CFG.multipliers || {}) };
+
+function creditMultipliersFor(model) {
+  const norm = String(model || "").toLowerCase();
+  if (CREDIT_MODELS[norm]) return CREDIT_MODELS[norm];
+  // Prefix match: glm-5.3-air bills at glm-5.3 rates
+  for (const [name, mult] of Object.entries(CREDIT_MODELS)) {
+    if (norm.startsWith(name)) return mult;
+  }
+  return null; // non-GLM model — not plan-billed, skip
+}
+
+// Peak hours per docs: Mon-Fri 14:00-18:00 Singapore time. SGT is a
+// fixed UTC+8 offset (no DST), so pure epoch math works regardless of
+// the host timezone — a German host in CET/CEST needs no conversion
+// tables. Wall clock trick: shift the epoch, read via getUTC*.
+const SGT_OFFSET_MS = 8 * 60 * 60 * 1000;
+function peakState(now) {
+  const sgt = new Date(now + SGT_OFFSET_MS);
+  const day = sgt.getUTCDay(); // 0=Sun .. 6=Sat
+  const mins = sgt.getUTCHours() * 60 + sgt.getUTCMinutes();
+  return day >= 1 && day <= 5 && mins >= 14 * 60 && mins < 18 * 60;
+}
+let peakCache = { at: 0, val: false };
+function isPeakNow(now = Date.now()) {
+  if (Math.abs(now - peakCache.at) < 30_000) return peakCache.val;
+  peakCache = { at: now, val: peakState(now) };
+  return peakCache.val;
+}
+// Minutes until the peak/off-peak state flips — for hints and /credits.
+function minutesUntilPeakChange(now = Date.now()) {
+  const sgt = new Date(now + SGT_OFFSET_MS);
+  const mins = sgt.getUTCHours() * 60 + sgt.getUTCMinutes();
+  const isWeekday = (d) => d >= 1 && d <= 5;
+  if (isWeekday(sgt.getUTCDay()) && mins >= 14 * 60 && mins < 18 * 60) {
+    return 18 * 60 - mins; // in peak: ends at 18:00 SGT
+  }
+  // Off-peak/weekend: scan forward for the next weekday 14:00 SGT
+  for (let add = 0; add <= 7; add++) {
+    const d = new Date(Date.UTC(sgt.getUTCFullYear(), sgt.getUTCMonth(), sgt.getUTCDate() + add));
+    if (!isWeekday(d.getUTCDay())) continue;
+    const targetMins = add * 24 * 60 + 14 * 60;
+    if (targetMins > mins) return targetMins - mins;
+  }
+  return 0;
+}
+
+// Weekly cycle: anchor = a known past reset time (ISO string). Without
+// one, fall back to a plain rolling 7-day window — accurate for the
+// 5h number, approximate for the weekly one.
+const CREDIT_WEEK_MS = 7 * 24 * 60 * 60 * 1000;
+const CREDITS_ANCHOR_MS = CREDITS_CFG.weeklyResetAnchor ? Date.parse(CREDITS_CFG.weeklyResetAnchor) : NaN;
+function weeklyCycleStart(now = Date.now()) {
+  if (!Number.isFinite(CREDITS_ANCHOR_MS)) return now - CREDIT_WEEK_MS;
+  // Anchor in the future = first reset hasn't happened yet; the current
+  // cycle started (subscription activation) 7 days before it.
+  if (CREDITS_ANCHOR_MS > now) return CREDITS_ANCHOR_MS - CREDIT_WEEK_MS;
+  return CREDITS_ANCHOR_MS + Math.floor((now - CREDITS_ANCHOR_MS) / CREDIT_WEEK_MS) * CREDIT_WEEK_MS;
+}
+function weeklyResetAt(now = Date.now()) {
+  return weeklyCycleStart(now) + CREDIT_WEEK_MS;
+}
+
+// Ledger: append-only {t, c} events, pruned to the weekly cycle (the
+// 5h window is contained inside it). Survives restarts via stateFile.
+let creditEvents = [];
+const creditWarnLevels = { fiveHour: 0, weekly: 0 }; // highest crossed warn level
+function warnLevels() {
+  const l1 = Math.max(1, Math.min(99, Math.round(CREDITS_WARN_PCT)));
+  return [l1, Math.min(99, l1 + 10), 100];
+}
+function levelForPct(pct) {
+  const levels = warnLevels();
+  let level = 0;
+  for (const pctMark of levels) if (pct >= pctMark) level++;
+  return level;
+}
+
+function pruneCreditEvents(now = Date.now()) {
+  const cutoff = weeklyCycleStart(now);
+  if (creditEvents.length && creditEvents[0].t < cutoff) {
+    creditEvents = creditEvents.filter((e) => e.t >= cutoff);
+  }
+}
+function creditsUsedSince(cutoff) {
+  let sum = 0;
+  for (const e of creditEvents) if (e.t >= cutoff) sum += e.c;
+  return sum;
+}
+function creditsSnapshot(now = Date.now()) {
+  const cap5h = CREDIT_CAPS.fiveHour || 0;
+  const capWk = CREDIT_CAPS.weekly || 0;
+  const used5h = creditsUsedSince(now - 5 * 60 * 60 * 1000);
+  const usedWk = creditsUsedSince(weeklyCycleStart(now));
+  return {
+    enabled: CREDITS_ENABLED,
+    fiveHour: {
+      used: +used5h.toFixed(2),
+      cap: cap5h,
+      pct: cap5h ? Math.round((used5h / cap5h) * 100) : 0,
+    },
+    weekly: {
+      used: +usedWk.toFixed(2),
+      cap: capWk,
+      pct: capWk ? Math.round((usedWk / capWk) * 100) : 0,
+      // A rolling window (no anchor) has no reset instant — report null
+      // rather than a meaningless "resets now".
+      ...(Number.isFinite(CREDITS_ANCHOR_MS)
+        ? {
+            resetsAt: new Date(weeklyResetAt(now)).toISOString(),
+            resetsInMin: Math.round((weeklyResetAt(now) - now) / 60000),
+          }
+        : { resetsAt: null, resetsInMin: null, window: "rolling-7d" }),
+    },
+    peak: {
+      now: isPeakNow(now),
+      changeInMin: Math.round(minutesUntilPeakChange(now)),
+    },
+    events: creditEvents.length,
+  };
+}
+
+// Book credits for one upstream response. usage = the Anthropic-format
+// usage object (input_tokens / cache_read_input_tokens /
+// cache_creation_input_tokens / output_tokens). Cache CREATION is fresh
+// input, so it bills at the input rate; cache READS bill at the cached
+// rate. Off-peak requests (by request START time) bill at 0.5x.
+function recordCredits(model, usage, startedAtMs = Date.now()) {
+  if (!CREDITS_ENABLED || !usage || typeof usage !== "object") return 0;
+  const mult = creditMultipliersFor(model);
+  if (!mult) return 0;
+  const input = (usage.input_tokens || 0) + (usage.cache_creation_input_tokens || 0);
+  const cached = usage.cache_read_input_tokens || 0;
+  const output = usage.output_tokens || 0;
+  let credits = (input * mult.in + cached * mult.cached + output * mult.out) / 10000;
+  if (!peakState(startedAtMs)) credits *= 0.5;
+  creditEvents.push({ t: startedAtMs, c: credits });
+  pruneCreditEvents();
+  scheduleCreditStateSave();
+  checkCreditThresholds(startedAtMs);
+  return credits;
+}
+
+// Console warns fire once per upward threshold crossing (and re-arm if
+// the sliding window recedes). Conversation hints are injected later,
+// on the session's next request — see maybeInjectCreditHints.
+function checkCreditThresholds(now = Date.now()) {
+  if (!CREDITS_ENABLED) return;
+  const snap = creditsSnapshot(now);
+  for (const kind of ["fiveHour", "weekly"]) {
+    const level = levelForPct(snap[kind].pct);
+    if (level > creditWarnLevels[kind]) {
+      creditWarnLevels[kind] = level;
+      const s = snap[kind];
+      const extra = kind === "weekly" && s.resetsInMin != null ? `, resets in ${Math.round(s.resetsInMin / 60)}h` : "";
+      console.warn(
+        `[router] credits: ${kind} usage at ${s.pct}% (${s.used} of ${s.cap}${extra})`
+      );
+    } else if (level < creditWarnLevels[kind]) {
+      creditWarnLevels[kind] = level; // window slid back below — re-arm
+    }
+  }
+}
+
+// One-time-per-session conversation hints (same injection pattern as
+// the compaction hint). Threshold hints fire on the request AFTER the
+// crossing (usage is only known once a response completes); the peak
+// hint is known up-front, so it fires on the first request of any
+// session during peak hours. At most one hint per request.
+function maybeInjectCreditHints(key, firstUserIdx, messages) {
+  if (!CREDITS_ENABLED || !CREDITS_HINTS || firstUserIdx < 0) return;
+  const done = sessionCreditHints.get(key) || new Set();
+  sessionCreditHints.set(key, done);
+  const snap = creditsSnapshot();
+  const warnPct = warnLevels()[0];
+  let hint = null;
+
+  if (!done.has("fiveHour") && snap.fiveHour.pct >= warnPct) {
+    hint =
+      `[router: ${snap.fiveHour.pct}% of the 5-hour GLM credit window is used ` +
+      `(${snap.fiveHour.used} of ${snap.fiveHour.cap} credits). The window replenishes ` +
+      `as spend ages out — if the upstream starts throttling, this is why.]`;
+    done.add("fiveHour");
+  } else if (!done.has("weekly") && snap.weekly.pct >= warnPct) {
+    hint =
+      `[router: ${snap.weekly.pct}% of the weekly GLM credits are used ` +
+      `(${snap.weekly.used} of ${snap.weekly.cap})` +
+      (snap.weekly.resetsAt ? ` — quota resets ${new Date(snap.weekly.resetsAt).toLocaleString()}` : "") +
+      ` — pace remaining usage accordingly.]`;
+    done.add("weekly");
+  } else if (!done.has("peak") && CREDITS_PEAK_HINT && snap.peak.now) {
+    hint =
+      `[router: peak hours (Mon-Fri 14:00-18:00 UTC+8) — GLM credits bill at ` +
+      `full rate for the next ~${snap.peak.changeInMin} min; outside peak they cost half.]`;
+    done.add("peak");
+  }
+
+  if (hint) {
+    appendTextToMessage(messages[firstUserIdx], "\n\n" + hint);
+    debugLog(`credits: injected ${[...done].pop()} hint into session ${key.slice(0, 10)}`);
+  }
+}
+const sessionCreditHints = new Map(); // sessionKey -> Set(hint kinds already sent)
+
+// Observe a streamed SSE response without interfering with it: a second
+// 'data' listener alongside pipe() receives the same chunks. The
+// usage-bearing events are message_start (input + cache tokens) and the
+// final message_delta (output tokens); credits are booked once the
+// stream settles (end/error/close — partial streams still count).
+function makeSseUsageScanner(onUsage) {
+  let buf = "";
+  let input = 0, cacheRead = 0, cacheCreate = 0, output = 0;
+  const take = (line) => {
+    if (!line.startsWith("data:")) return;
+    const payload = line.slice(5).trim();
+    if (!payload || payload === "[DONE]") return;
+    let ev;
+    try { ev = JSON.parse(payload); } catch (_) { return; }
+    if (ev.type === "message_start" && ev.message && ev.message.usage) {
+      input = ev.message.usage.input_tokens || 0;
+      cacheRead = ev.message.usage.cache_read_input_tokens || 0;
+      cacheCreate = ev.message.usage.cache_creation_input_tokens || 0;
+    } else if (ev.type === "message_delta" && ev.usage) {
+      output = ev.usage.output_tokens || output;
+    }
+  };
+  let settled = false;
+  return {
+    push(chunk) {
+      buf += chunk.toString("utf8");
+      let nl;
+      while ((nl = buf.indexOf("\n")) >= 0) {
+        take(buf.slice(0, nl).replace(/\r$/, ""));
+        buf = buf.slice(nl + 1);
+      }
+      if (buf.length > 64 * 1024) buf = buf.slice(-1024); // runaway line safety
+    },
+    end() {
+      if (settled) return;
+      settled = true;
+      if (buf) take(buf.replace(/\r$/, ""));
+      onUsage({
+        input_tokens: input,
+        cache_read_input_tokens: cacheRead,
+        cache_creation_input_tokens: cacheCreate,
+        output_tokens: output,
+      });
+    },
+  };
+}
+
+function trackStreamedUsage(readable, model, startedAtMs) {
+  const scanner = makeSseUsageScanner((usage) => recordCredits(model, usage, startedAtMs));
+  readable.on("data", (chunk) => scanner.push(chunk));
+  readable.on("end", () => scanner.end());
+  readable.on("error", () => scanner.end());
+  readable.on("close", () => scanner.end());
+}
+
+// --- persistence: the weekly window must survive restarts ---
+const CREDITS_STATE_FILE = CREDITS_CFG.stateFile !== undefined ? CREDITS_CFG.stateFile : "credits-state.json";
+function creditsStatePath() {
+  return path.isAbsolute(String(CREDITS_STATE_FILE))
+    ? String(CREDITS_STATE_FILE)
+    : path.join(path.dirname(CONFIG_PATH), CREDITS_STATE_FILE);
+}
+let creditSaveTimer = null;
+function scheduleCreditStateSave() {
+  if (!CREDITS_ENABLED || creditSaveTimer) return;
+  creditSaveTimer = setTimeout(() => {
+    creditSaveTimer = null;
+    saveCreditState();
+  }, 3000);
+  creditSaveTimer.unref();
+}
+function saveCreditState() {
+  if (!CREDITS_ENABLED) return;
+  try {
+    pruneCreditEvents();
+    const p = creditsStatePath();
+    fs.writeFileSync(p + ".tmp", JSON.stringify({ v: 1, events: creditEvents, warnLevels: creditWarnLevels }));
+    fs.renameSync(p + ".tmp", p);
+  } catch (e) {
+    console.warn(`[router] credits: state save failed: ${e.message}`);
+  }
+}
+(function loadCreditState() {
+  if (!CREDITS_ENABLED) return;
+  try {
+    const p = creditsStatePath();
+    const st = JSON.parse(fs.readFileSync(p, "utf8"));
+    if (Array.isArray(st.events)) {
+      creditEvents = st.events.filter((e) => e && Number.isFinite(e.t) && Number.isFinite(e.c));
+    }
+    if (st.warnLevels) Object.assign(creditWarnLevels, st.warnLevels);
+    pruneCreditEvents();
+    console.log(`[router] credits: restored ${creditEvents.length} event(s) from ${p}`);
+  } catch (_) { /* no state file yet — fine */ }
+})();
+
+// ---------------------------------------------------------------
 // API key resolution: env vars override config.json
 // Supports per-route env vars + generic ROUTE_<NAME>_API_KEY pattern.
 // ---------------------------------------------------------------
@@ -1546,10 +1884,28 @@ const server = http.createServer(async (req, res) => {
         budgetMax: BUDGET_MAX,
         budgetBreachedSessions: budgetBreached,
         totalEscalations,
+        creditsEnabled: CREDITS_ENABLED,
+        credits5hPct: CREDITS_ENABLED ? creditsSnapshot().fiveHour.pct : null,
+        creditsWeekPct: CREDITS_ENABLED ? creditsSnapshot().weekly.pct : null,
+        peakNow: isPeakNow(),
         repoMapFiles: repoMapFileCount,
         repoMapBytes: repoMapBytes,
       })
     );
+    return;
+  }
+
+  // Live GLM Coding Plan credit usage: 5-hour sliding window, weekly
+  // cycle, peak-hour state. Numbers reflect only traffic that went
+  // THROUGH the router (Z.AI MCP calls bypass it).
+  if (req.method === "GET" && pathname === "/credits") {
+    if (!CREDITS_ENABLED) {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ enabled: false, note: "set credits.enabled=true in config.json" }, null, 2));
+      return;
+    }
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify(creditsSnapshot(), null, 2));
     return;
   }
 
@@ -1670,6 +2026,7 @@ const server = http.createServer(async (req, res) => {
   body = JSON.parse(JSON.stringify(body));
 
   const key = sessionKey(body);
+  const requestStart = Date.now(); // credit billing instant (peak vs off-peak)
   const { text, isToolResultOnly, index } = extractLastUserTurn(body.messages || []);
   const contextSummary = extractContextSummary(body.messages || []);
 
@@ -1837,6 +2194,12 @@ const server = http.createServer(async (req, res) => {
     debugLog(`compaction hint injected at ${countUserTextTurns(body.messages)} turns`);
   }
 
+  // Credit hints (one per session): 5h/weekly threshold crossing or a
+  // peak-hours notice. Injected BEFORE the upstream call so this turn's
+  // mutated body already carries it; threshold state comes from the
+  // previous turn's recorded usage.
+  maybeInjectCreditHints(key, repoMapFirstIdx, body.messages);
+
   // Budget enforcement: if session has breached budget, downgrade to cheapest
   // tier (or reject). This prevents a single runaway session from burning
   // through tokens — costWeights now have teeth, not just logging.
@@ -1894,6 +2257,7 @@ const server = http.createServer(async (req, res) => {
       const cloned = upstream.clone();
       try {
         const data = await cloned.json();
+        recordCredits(backend.model, data.usage, requestStart);
         const textContent = (data.content || [])
           .filter((b) => b.type === "text")
           .map((b) => b.text)
@@ -1915,7 +2279,9 @@ const server = http.createServer(async (req, res) => {
               const escUpstream = await callBackend(escBackend, escBody, { stream: false });
               const escHeaders = { "content-type": escUpstream.headers.get("content-type") || "application/json" };
               res.writeHead(escUpstream.status, escHeaders);
-              res.end(await escUpstream.text());
+              const escText = await escUpstream.text();
+              try { recordCredits(escBackend.model, JSON.parse(escText).usage, requestStart); } catch (_) {}
+              res.end(escText);
               return;
             } catch (escE) {
               // Escalation failed too — fall through to send original response
@@ -1941,7 +2307,9 @@ const server = http.createServer(async (req, res) => {
           const escUpstream = await callBackend(escBackend, escBody, { stream: false });
           const escHeaders = { "content-type": escUpstream.headers.get("content-type") || "application/json" };
           res.writeHead(escUpstream.status, escHeaders);
-          res.end(await escUpstream.text());
+          const escText = await escUpstream.text();
+          try { recordCredits(escBackend.model, JSON.parse(escText).usage, requestStart); } catch (_) {}
+          res.end(escText);
           return;
         } catch (escE) {
           console.warn(`[router] escalation also failed: ${escE.message}`);
@@ -1959,6 +2327,10 @@ const server = http.createServer(async (req, res) => {
         if (!res.writableEnded) res.end();
       });
       readable.pipe(res);
+      // pipe() first, then observe: both listeners receive every chunk.
+      if (CREDITS_ENABLED && body.stream && upstream.status === 200) {
+        trackStreamedUsage(readable, backend.model, requestStart);
+      }
     } else {
       res.end(await upstream.text());
     }
@@ -1995,6 +2367,23 @@ server.listen(PORT, HOST, () => {
   else console.log(`[router] budgetMax=none (set budgetMax in config.json to enforce)`);
   console.log(`[router] autoEscalation=enabled (max ${MAX_ESCALATIONS_PER_SESSION}/session, on failure patterns + 5xx)`);
   console.log(`[router] compactHint=${COMPACT_HINT_TURNS > 0 ? `at ${COMPACT_HINT_TURNS} turns` : "disabled"} (set compactHintTurns in config.json to adjust)`);
+  if (CREDITS_ENABLED) {
+    console.log(
+      `[router] credits: tracking GLM plan — ${CREDIT_CAPS.fiveHour}/5h + ${CREDIT_CAPS.weekly}/wk, ` +
+        `warn at ${CREDITS_WARN_PCT}%, hints=${CREDITS_HINTS ? "on" : "off"}, off-peak=0.5x ` +
+        `(peak Mon-Fri 14:00-18:00 UTC+8)`
+    );
+    if (Number.isFinite(CREDITS_ANCHOR_MS)) {
+      console.log(`[router] credits: weekly cycle resets ${new Date(weeklyResetAt()).toLocaleString()} local (anchor ${CREDITS_CFG.weeklyResetAnchor})`);
+    } else {
+      console.log(`[router] credits: no weeklyResetAnchor set — weekly window is a rolling 7 days (approximate)`);
+    }
+  } else {
+    console.log(`[router] credits=disabled (set credits.enabled=true in config.json)`);
+  }
+  if (CREDITS_CFG.weeklyResetAnchor && !Number.isFinite(CREDITS_ANCHOR_MS)) {
+    console.warn(`[router] credits: weeklyResetAnchor is not a valid date: ${JSON.stringify(CREDITS_CFG.weeklyResetAnchor)}`);
+  }
   console.log(`[router] upstreamTimeout=${UPSTREAM_TIMEOUT_MS}ms maxSessions=${MAX_SESSIONS} maxBody=${(MAX_BODY_BYTES / (1024 * 1024)).toFixed(0)}MB`);
   console.log(`[router] tools.minComplexity=${TOOLS_MIN_COMPLEXITY}` +
     (TOOLS_FIXED_MODEL ? ` tools.model=${TOOLS_FIXED_MODEL}` : ""));
@@ -2095,6 +2484,7 @@ function shutdown(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
   console.log(`\n[router] ${signal} received — shutting down...`);
+  saveCreditState(); // flush the weekly ledger so restarts don't lose usage
   server.close(() => {
     console.log("[router] closed.");
     process.exit(0);
