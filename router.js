@@ -527,6 +527,7 @@ const CLASSIFY_CACHE_TTL_MS = config.classifyCacheTtlMs ?? 60_000;
 const classifyCache = new Map();
 
 function getCachedClassification(cacheKey) {
+  if (CLASSIFY_CACHE_TTL_MS <= 0) return null; // caching disabled
   const entry = classifyCache.get(cacheKey);
   if (!entry) return null;
   if (Date.now() - entry.ts > CLASSIFY_CACHE_TTL_MS) {
@@ -537,6 +538,7 @@ function getCachedClassification(cacheKey) {
 }
 
 function setCachedClassification(cacheKey, result) {
+  if (CLASSIFY_CACHE_TTL_MS <= 0) return; // caching disabled
   classifyCache.set(cacheKey, { result, ts: Date.now() });
   // Cap cache size (LRU-ish: delete oldest)
   if (classifyCache.size > 500) {
@@ -972,6 +974,8 @@ async function callClassifier(payload) {
 // prompt is ambiguous enough to warrant full classification.
 // This saves a classifier call (+ latency + tokens) on the
 // most common patterns in coding sessions.
+// Set "heuristic": false in config to always go through the classifier.
+const HEURISTIC_ENABLED = config.heuristic !== false;
 function heuristicClassify(userText, contextSummary) {
   const lower = userText.toLowerCase().trim();
 
@@ -1708,7 +1712,7 @@ const server = http.createServer(async (req, res) => {
     }
   } else {
     // Try heuristic pre-filter first (saves a classifier call for obvious cases)
-    const heuristic = heuristicClassify(text, contextSummary);
+    const heuristic = HEURISTIC_ENABLED ? heuristicClassify(text, contextSummary) : null;
     let t;
     if (heuristic) {
       t = heuristic;
@@ -2095,6 +2099,11 @@ function shutdown(signal) {
     console.log("[router] closed.");
     process.exit(0);
   });
+  // fetch()-based clients hold idle keep-alive sockets open, which keeps
+  // server.close()'s callback pending until they idle out — drop the
+  // idle ones so shutdown completes promptly (in-flight streams still
+  // get the 10s grace below).
+  if (typeof server.closeIdleConnections === "function") server.closeIdleConnections();
   setTimeout(() => {
     console.error("[router] forced exit after 10s — some connections did not close.");
     process.exit(1);

@@ -18,9 +18,11 @@ const path = require("path");
 
 const ROOT = path.join(__dirname, "..");
 const LOG_DIR = path.join(__dirname, "logs");
-const ROUTER_PORT = 9877;
-const AN_PORT = 9911;
-const OL_PORT = 9912;
+// Ports are env-overridable so the suite can run next to a live router
+// (e.g. TEST_ROUTER_PORT=9879 npm test while the real one holds 9877).
+const ROUTER_PORT = Number(process.env.TEST_ROUTER_PORT || 9877);
+const AN_PORT = Number(process.env.TEST_AN_PORT || 9911);
+const OL_PORT = Number(process.env.TEST_OL_PORT || 9912);
 const AN_BASE = `http://localhost:${AN_PORT}`;
 const OL_BASE = `http://localhost:${OL_PORT}`;
 
@@ -98,7 +100,11 @@ function startMock(env = {}) {
   return waitReady(mockProc, "mock", 10_000);
 }
 
-function startRouter(configFile, env = {}) {
+async function startRouter(configFile, env = {}) {
+  // Never leak the previous instance: overwriting routerProc without
+  // stopping it leaves a process holding the port, and this spawn dies
+  // on EADDRINUSE. stopRouter is hoisted, so this is safe to call here.
+  await stopRouter();
   routerProc = spawn(process.execPath, [path.join(ROOT, "router.js")], {
     env: {
       ...process.env,
@@ -138,10 +144,7 @@ async function stopMock() {
   const p = mockProc;
   mockProc = null;
   p.kill("SIGTERM");
-  await new Promise((r) => {
-    p.on("exit", r);
-    setTimeout(r, 2000);
-  });
+  await stopProc(p);
 }
 
 // ---------------------------------------------------------------
@@ -204,7 +207,7 @@ const TIER_MODELS = {
   super_hard: "tier-opus",
 };
 
-function buildConfig({ tools = {}, routes = TIER_MODELS, classifierModel = "classifier-flash", repoMap = { enabled: false } } = {}) {
+function buildConfig({ tools = {}, routes = TIER_MODELS, classifierModel = "classifier-flash", repoMap = { enabled: false }, heuristic = false, classifyCacheTtlMs = 0 } = {}) {
   const cfg = {
     port: ROUTER_PORT,
     tools,
@@ -216,6 +219,11 @@ function buildConfig({ tools = {}, routes = TIER_MODELS, classifierModel = "clas
       ])
     ),
   };
+  // Most suites test routing THROUGH the classifier, so the two
+  // classification shortcuts stay off by default — dedicated tests
+  // below opt in and cover them directly.
+  cfg.heuristic = heuristic;
+  cfg.classifyCacheTtlMs = classifyCacheTtlMs;
   // repoMap defaults OFF for the general suites so they stay hermetic —
   // the repo-map suite below opts in with its own configs + fixture root.
   if (repoMap) cfg.repoMap = repoMap;
@@ -256,6 +264,10 @@ const TOOLS = [{ name: "Bash", description: "Run a bash command", input_schema: 
 async function runTests() {
   console.log("== booting mock backends ==");
   fs.rmSync(path.join(LOG_DIR, "requests.jsonl"), { force: true });
+  // Also clear behavior controls: a crashed/filtered previous run can
+  // leave CLASSIFIER_REPLY behind, and the mock would serve the stale
+  // reply to this run's first suites.
+  fs.rmSync(path.join(LOG_DIR, "CLASSIFIER_REPLY"), { force: true });
   setTierStatus(200);
   await startMock();
 
@@ -331,6 +343,41 @@ async function runTests() {
     ok(r.text.includes("reply-from-tier-hard"), "short follow-up inherited hard", r.text);
     eq(chatCalls()[1].model, "tier-hard", "turn 2 also tier-hard");
     eq(classifierCalls().length, 1, "turn 2 skipped the classifier (inheritance)");
+  });
+
+  await test("json: heuristic pre-filter classifies without the classifier", async () => {
+    const p = path.join(LOG_DIR, "config-heuristic.json");
+    fs.writeFileSync(p, JSON.stringify(buildConfig({ heuristic: true }), null, 2));
+    await startRouter(p, { ROUTES_PATH: NO_ROUTES });
+    clearLog();
+    // Garbage reply would fall back to medium if the classifier ran at
+    // all — the heuristic must answer "refactor" -> hard on its own.
+    setReply("definitely not json");
+    const r = await post("/v1/messages", msgBody({
+      messages: [{ role: "user", content: "Refactor the authentication module across many files with tests" }],
+    }));
+    ok(r.text.includes("reply-from-tier-hard"), "heuristic routed refactor -> hard", r.text);
+    eq(classifierCalls().length, 0, "classifier skipped entirely");
+    await stopRouter();
+    await startRouter(CFG_JSON, { ROUTES_PATH: NO_ROUTES });
+  });
+
+  await test("json: classify cache reuses the first classification of a prompt", async () => {
+    const p = path.join(LOG_DIR, "config-cache.json");
+    fs.writeFileSync(p, JSON.stringify(buildConfig({ classifyCacheTtlMs: 60_000 }), null, 2));
+    await startRouter(p, { ROUTES_PATH: NO_ROUTES });
+    clearLog();
+    const MSG_CACHE = [{ role: "user", content: "Analyze this interesting dataset and produce a report of the findings" }];
+    setReply(JSON.stringify({ complexity: "easy", clarity: "clear", assumptions: [] }));
+    await post("/v1/messages", msgBody({ messages: MSG_CACHE }));
+    // Same prompt again — reply now says super_hard, but the cached
+    // easy classification (within TTL) must win without a classifier call.
+    setReply(JSON.stringify({ complexity: "super_hard", clarity: "clear", assumptions: [] }));
+    await post("/v1/messages", msgBody({ messages: MSG_CACHE }));
+    eq(classifierCalls().length, 1, "second identical prompt was a cache hit");
+    eq(chatCalls()[1].model, "tier-easy", "cached easy routing reused");
+    await stopRouter();
+    await startRouter(CFG_JSON, { ROUTES_PATH: NO_ROUTES });
   });
 
   await test("json: short message w/o context defaults to super_easy", async () => {
@@ -813,6 +860,8 @@ async function runTests() {
     const cfg = {
       baseUrl: AN_BASE,
       apiKey: "shared-key",
+      heuristic: false,
+      classifyCacheTtlMs: 0,
       classifier: { model: "classifier-flash" },
       routes: {
         super_easy: "tier-flash",
@@ -843,6 +892,8 @@ async function runTests() {
     const cfg = {
       baseUrl: AN_BASE,
       apiKey: "shared-key",
+      heuristic: false,
+      classifyCacheTtlMs: 0,
       classifier: { model: "classifier-flash" },
       routes: {
         medium: "tier-medium",
