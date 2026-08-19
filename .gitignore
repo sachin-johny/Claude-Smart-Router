@@ -1,6 +1,7 @@
 # Secrets — never commit these
 .env
 config.json
+credits-state.json
 
 # Test artifacts
 test/logs
