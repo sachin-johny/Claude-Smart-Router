@@ -470,6 +470,45 @@ const COST_WEIGHTS = config.costWeights || {
   super_hard: 1.00,
 };
 
+// Budget enforcement: track cumulative cost per session.
+// If budgetMax is set in config, sessions exceeding it get downgraded
+// to the cheapest tier (or rejected if budgetReject=true).
+const BUDGET_MAX = config.budgetMax ?? null;     // e.g. 10.0 = 10x medium-equivalent
+const BUDGET_REJECT = config.budgetReject ?? false; // true = 429 on budget breach
+const sessionBudget = new Map(); // key -> { cumulative, breachedAt }
+
+function addSessionCost(key, costWeight) {
+  const entry = sessionBudget.get(key) || { cumulative: 0, breachedAt: null };
+  entry.cumulative += costWeight;
+  if (BUDGET_MAX && entry.cumulative >= BUDGET_MAX && !entry.breachedAt) {
+    entry.breachedAt = Date.now();
+    console.warn(`[router] budget: session ${key.slice(0,10)} hit budget cap (${entry.cumulative.toFixed(2)} >= ${BUDGET_MAX})`);
+  }
+  sessionBudget.set(key, entry);
+  return entry;
+}
+
+// Failure-based auto-escalation: if a cheap tier produces obviously
+// broken output (empty, malformed tool calls, error messages), retry
+// on the next-higher tier. Capped at 1 escalation per session to
+// prevent loops.
+const FAILURE_PATTERNS = [
+  /error:\s*(tool_use|tool_result|invalid|malformed)/i,
+  /i cannot (?:complete|fulfill|perform|execute)/i,
+  /(?:failed|unable) to (?:parse|execute|run|call)/i,
+  /tool_use.*malformed/i,
+];
+const MAX_ESCALATIONS_PER_SESSION = 1;
+const sessionEscalations = new Map(); // key -> count
+
+// Compaction hint: the router can't call Claude Code's /compact directly
+// (it's a client-side CLI command), but it CAN inject a one-time hint
+// into the conversation when it's getting long. The model then surfaces
+// this to the user. Configurable threshold; set compactHintTurns to 0
+// to disable.
+const COMPACT_HINT_TURNS = config.compactHintTurns ?? 15;
+const sessionCompactedHint = new Map(); // key -> true (hinted already)
+
 // ---------------------------------------------------------------
 // Sticky session map: lets us skip re-classifying tool-result
 // continuations AND lets short follow-ups inherit context complexity
@@ -477,6 +516,34 @@ const COST_WEIGHTS = config.costWeights || {
 // ---------------------------------------------------------------
 
 const sessionBackend = new Map();
+
+// ---------------------------------------------------------------
+// Classification cache: avoid re-classifying identical prompts
+// Keyed by hash of (userText + contextSummary), TTL-based.
+// A short TTL (60s) balances freshness vs. classifier call savings.
+// ---------------------------------------------------------------
+
+const CLASSIFY_CACHE_TTL_MS = config.classifyCacheTtlMs ?? 60_000;
+const classifyCache = new Map();
+
+function getCachedClassification(cacheKey) {
+  const entry = classifyCache.get(cacheKey);
+  if (!entry) return null;
+  if (Date.now() - entry.ts > CLASSIFY_CACHE_TTL_MS) {
+    classifyCache.delete(cacheKey);
+    return null;
+  }
+  return entry.result;
+}
+
+function setCachedClassification(cacheKey, result) {
+  classifyCache.set(cacheKey, { result, ts: Date.now() });
+  // Cap cache size (LRU-ish: delete oldest)
+  if (classifyCache.size > 500) {
+    const oldest = classifyCache.keys().next().value;
+    classifyCache.delete(oldest);
+  }
+}
 
 // ---------------------------------------------------------------
 // API key resolution: env vars override config.json
@@ -653,19 +720,29 @@ function countUserTextTurns(messages) {
 // This is the "context inheritance" pattern from alexrudloff/llmrouter:
 // short follow-ups like "yes" or "try now?" should inherit the
 // complexity of the ongoing task, not be classified as super_easy.
-function extractContextSummary(messages, maxChars = 300) {
+// Extended context summary: includes recent assistant AND user text turns
+// for better classification accuracy. Default 800 chars (up from 300) —
+// the classifier is a cheap model; 800 chars is ~200 tokens, trivial cost
+// for meaningfully better context inheritance.
+function extractContextSummary(messages, maxChars = 800) {
   const recent = [];
   let total = 0;
   for (let i = messages.length - 1; i >= 0 && total < maxChars; i--) {
     const m = messages[i];
-    if (m.role === "assistant") {
+    // Include both assistant and user text (not tool_result blocks)
+    if (m.role === "assistant" || m.role === "user") {
       let text = "";
       if (typeof m.content === "string") text = m.content;
       else if (Array.isArray(m.content)) {
-        text = m.content.filter((b) => b.type === "text").map((b) => b.text).join(" ");
+        // For user messages, skip tool_result blocks (they're noise)
+        const blocks = m.role === "user"
+          ? m.content.filter((b) => b.type === "text")
+          : m.content.filter((b) => b.type === "text");
+        text = blocks.map((b) => b.text).join(" ");
       }
-      if (text) {
-        recent.unshift(text.slice(0, maxChars));
+      if (text && text.trim()) {
+        const prefix = m.role === "user" ? "U: " : "A: ";
+        recent.unshift(prefix + text.slice(0, Math.floor(maxChars / 2)));
         total += text.length;
       }
     }
@@ -836,30 +913,97 @@ async function callClassifier(payload) {
     headers["x-api-key"] = backend.apiKey;
   }
 
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 30_000);
-  try {
-    const res = await fetch(url, {
-      method: "POST",
-      headers,
-      body: JSON.stringify(payload),
-      signal: controller.signal,
-    });
-    if (!res.ok) throw new Error(`classifier HTTP ${res.status}`);
-    const data = await res.json();
-    return (data.content || [])
-      .filter((b) => b.type === "text")
-      .map((b) => b.text)
-      .join("")
-      .trim();
-  } finally {
-    clearTimeout(timer);
+  // Retry with exponential backoff on rate-limit (429/529/503) errors.
+  // The classifier is on the hot path — a transient 529 shouldn't force
+  // every request to default to medium. Up to 3 attempts: 0s, 1s, 2s.
+  const MAX_CLASSIFIER_RETRIES = config.classifier?.maxRetries ?? 3;
+  const RETRYABLE_STATUS = new Set([429, 503, 529, 520, 524]);
+
+  for (let attempt = 0; attempt < MAX_CLASSIFIER_RETRIES; attempt++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 30_000);
+    try {
+      const res = await fetch(url, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(payload),
+        signal: controller.signal,
+      });
+      if (!res.ok) {
+        if (RETRYABLE_STATUS.has(res.status) && attempt < MAX_CLASSIFIER_RETRIES - 1) {
+          const delay = attempt * 1000; // 0, 1s, 2s
+          debugLog(`classifier HTTP ${res.status}, retry ${attempt + 1}/${MAX_CLASSIFIER_RETRIES} in ${delay}ms`);
+          clearTimeout(timer);
+          if (delay > 0) await new Promise((r) => setTimeout(r, delay));
+          continue;
+        }
+        throw new Error(`classifier HTTP ${res.status}`);
+      }
+      const data = await res.json();
+      return (data.content || [])
+        .filter((b) => b.type === "text")
+        .map((b) => b.text)
+        .join("")
+        .trim();
+    } catch (e) {
+      // AbortError or network error — retry if attempts remain
+      if (attempt < MAX_CLASSIFIER_RETRIES - 1 && (e.name === "AbortError" || e.message.includes("ECONN"))) {
+        const delay = (attempt + 1) * 1000;
+        debugLog(`classifier error: ${e.message}, retry ${attempt + 1}/${MAX_CLASSIFIER_RETRIES} in ${delay}ms`);
+        clearTimeout(timer);
+        await new Promise((r) => setTimeout(r, delay));
+        continue;
+      }
+      throw e;
+    } finally {
+      clearTimeout(timer);
+    }
   }
+  // Should not reach here, but defensive
+  throw new Error("classifier: all retries exhausted");
 }
 
 // ---------------------------------------------------------------
 // Triage: classify complexity + clarity
 // ---------------------------------------------------------------
+
+// Heuristic pre-filter: skip the classifier entirely for prompts
+// that are obviously one complexity level. Returns null if the
+// prompt is ambiguous enough to warrant full classification.
+// This saves a classifier call (+ latency + tokens) on the
+// most common patterns in coding sessions.
+function heuristicClassify(userText, contextSummary) {
+  const lower = userText.toLowerCase().trim();
+
+  // Greetings / acknowledgments → super_easy
+  if (/^(hi|hey|hello|thanks|thank you|ok|okay|done|bye|good|yes|no|sure|cool|got it|right|correct|agreed|np|yw)\b/.test(lower) && !contextSummary) {
+    return { complexity: "super_easy", clarity: "clear", assumptions: [], source: "heuristic" };
+  }
+
+  // Pure greetings even with context → easy (not super_easy, context exists)
+  if (/^(hi|hey|hello|thanks|bye)\s*[!.]?\s*$/.test(lower) && contextSummary) {
+    return { complexity: "easy", clarity: "clear", assumptions: [], source: "heuristic" };
+  }
+
+  // Obvious hard/super_hard keywords → skip classifier
+  const hardKeywords = /\b(refactor|redesign|architect|distribute|scale|optimize|migrate|debug\s+crash|multi-?file|rewrite|overhaul)\b/i;
+  const superHardKeywords = /\b(design\s+(system|architecture|distributed|infra)|prove|autonomous|from\s+scratch|ground\s+up)\b/i;
+
+  if (superHardKeywords.test(userText)) {
+    return { complexity: "super_hard", clarity: "clear", assumptions: [], source: "heuristic" };
+  }
+  if (hardKeywords.test(userText)) {
+    return { complexity: "hard", clarity: "clear", assumptions: [], source: "heuristic" };
+  }
+
+  // Very short (< 10 words) with context → inherit, don't re-classify
+  if (wordCount(userText) < 10 && contextSummary) {
+    return null; // let the session inheritance logic handle it
+  }
+
+  // No heuristic match → fall through to classifier
+  return null;
+}
 
 async function triage(userText, systemPrompt, contextSummary) {
   const sysSnippet = typeof systemPrompt === "string"
@@ -869,7 +1013,18 @@ async function triage(userText, systemPrompt, contextSummary) {
   const { format } = buildTriagePrompt(userText, sysSnippet, contextSummary);
 
   // --- Keyword-format triage (from ROUTES.md / alexrudloff pattern) ---
+  // Enhanced: also extract clarity from keyword responses. The keyword
+  // prompt now asks for "complexity|clarity" format. If the response
+  // only contains a complexity word, clarity defaults to "clear".
   if (format === "keyword") {
+    // Check classification cache first
+    const cacheKey = crypto.createHash("sha1").update(`kw:${userText}|ctx:${contextSummary || ""}`).digest("hex");
+    const cached = getCachedClassification(cacheKey);
+    if (cached) {
+      debugLog(`classifier cache hit for keyword triage (key=${cacheKey.slice(0,8)})`);
+      return cached;
+    }
+
     const { prompt } = buildTriagePrompt(userText, sysSnippet, contextSummary);
     try {
       const resultText = await callClassifier({
@@ -880,8 +1035,24 @@ async function triage(userText, systemPrompt, contextSummary) {
       });
       debugLog(`classifier (${config.classifier.model}) replied: ${JSON.stringify(resultText.slice(0, 200))}`);
       const complexity = extractComplexityKeyword(resultText);
-      // No clarity/assumptions in keyword mode — just complexity
-      return { complexity, clarity: "clear", assumptions: [] };
+
+      // Extract clarity from keyword response (format: "medium|ambiguous")
+      const cleaned = resultText.toLowerCase().replace(/<think>.*?<\/think>/gs, "").trim();
+      const clarityMatch = cleaned.match(/\|\s*(ambiguous|clear)\s*$/);
+      const clarity = clarityMatch ? clarityMatch[1] : "clear";
+      // Extract assumptions if clarity is ambiguous and response has them
+      let assumptions = [];
+      if (clarity === "ambiguous") {
+        const assumeMatch = cleaned.match(/assumptions?:\s*(.+)/i);
+        if (assumeMatch) {
+          assumptions = assumeMatch[1].split(/[;,]/).map(a => a.trim()).filter(a => a).slice(0, 4);
+        }
+        if (!assumptions.length) assumptions = ["proceeding with best guess"];
+      }
+
+      const result = { complexity, clarity, assumptions };
+      setCachedClassification(cacheKey, result);
+      return result;
     } catch (e) {
       console.warn(`[router] triage failed, defaulting to medium/clear: ${e.message}`);
       return { complexity: "medium", clarity: "clear", assumptions: [] };
@@ -926,6 +1097,14 @@ async function triage(userText, systemPrompt, contextSummary) {
     ],
   };
 
+  // Check classification cache
+  const jsonCacheKey = crypto.createHash("sha1").update(`json:${userText}|ctx:${contextSummary || ""}|sys:${sysSnippet || ""}`).digest("hex");
+  const jsonCached = getCachedClassification(jsonCacheKey);
+  if (jsonCached) {
+    debugLog(`classifier cache hit for JSON triage (key=${jsonCacheKey.slice(0,8)})`);
+    return jsonCached;
+  }
+
   try {
     const raw = await callClassifier(triageBody);
     debugLog(`classifier (${config.classifier.model}) replied: ${JSON.stringify(raw.slice(0, 300))}`);
@@ -934,11 +1113,13 @@ async function triage(userText, systemPrompt, contextSummary) {
     const complexity = COMPLEXITY_LEVELS.includes(parsed.complexity)
       ? parsed.complexity
       : "medium";
-    return {
+    const result = {
       complexity,
       clarity: parsed.clarity === "ambiguous" ? "ambiguous" : "clear",
       assumptions: Array.isArray(parsed.assumptions) ? parsed.assumptions.slice(0, 4) : [],
     };
+    setCachedClassification(jsonCacheKey, result);
+    return result;
   } catch (e) {
     console.warn(`[router] triage failed, defaulting to medium/clear: ${e.message}`);
     return { complexity: "medium", clarity: "clear", assumptions: [] };
@@ -1348,12 +1529,21 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (req.method === "GET" && req.url === "/health") {
+    const budgetBreached = [...sessionBudget.values()].filter((e) => e.breachedAt).length;
+    const totalEscalations = [...sessionEscalations.values()].reduce((s, c) => s + c, 0);
     res.writeHead(200, { "content-type": "application/json" });
     res.end(
       JSON.stringify({
         status: "ok",
         uptimeSeconds: Math.floor(process.uptime()),
         sessions: sessionBackend.size,
+        classifyCacheSize: classifyCache.size,
+        classifyCacheTtlMs: CLASSIFY_CACHE_TTL_MS,
+        budgetMax: BUDGET_MAX,
+        budgetBreachedSessions: budgetBreached,
+        totalEscalations,
+        repoMapFiles: repoMapFileCount,
+        repoMapBytes: repoMapBytes,
       })
     );
     return;
@@ -1517,12 +1707,21 @@ const server = http.createServer(async (req, res) => {
       classifiedComplexity = "super_easy";
     }
   } else {
-    const t = await triage(text, body.system, contextSummary);
+    // Try heuristic pre-filter first (saves a classifier call for obvious cases)
+    const heuristic = heuristicClassify(text, contextSummary);
+    let t;
+    if (heuristic) {
+      t = heuristic;
+      debugLog(`heuristic pre-filter: ${text.slice(0,60)} -> ${t.complexity} (${t.source})`);
+    } else {
+      t = await triage(text, body.system, contextSummary);
+    }
     decision = { complexity: t.complexity, assumptions: t.clarity === "ambiguous" ? t.assumptions : [] };
     classifiedComplexity = t.complexity;
     console.log(
       `[router] complexity=${t.complexity} clarity=${t.clarity}` +
-        (t.assumptions.length ? ` assumptions=${JSON.stringify(t.assumptions)}` : "")
+        (t.assumptions.length ? ` assumptions=${JSON.stringify(t.assumptions)}` : "") +
+        (t.source ? ` source=${t.source}` : "")
     );
   }
 
@@ -1613,6 +1812,45 @@ const server = http.createServer(async (req, res) => {
     );
   }
 
+  // Compaction hint: when the conversation is long and hasn't been hinted
+  // yet for this session, inject a one-time nudge suggesting /compact.
+  // This is cache-safe — it appends after the repo-map block on the first
+  // user message, and fires at most once per session. The hint doesn't
+  // change the message structure (no new messages, no reordering), just
+  // adds text that the model may surface to the user.
+  if (
+    COMPACT_HINT_TURNS > 0 &&
+    !sessionCompactedHint.has(key) &&
+    countUserTextTurns(body.messages) >= COMPACT_HINT_TURNS &&
+    repoMapFirstIdx >= 0
+  ) {
+    const hint =
+      "\n\n[router: this conversation is getting long. Consider running /compact " +
+      "to reduce context and improve response quality. You can also set " +
+      "compactHintTurns in config.json to adjust this threshold.]";
+    appendTextToMessage(body.messages[repoMapFirstIdx], hint);
+    sessionCompactedHint.set(key, true);
+    debugLog(`compaction hint injected at ${countUserTextTurns(body.messages)} turns`);
+  }
+
+  // Budget enforcement: if session has breached budget, downgrade to cheapest
+  // tier (or reject). This prevents a single runaway session from burning
+  // through tokens — costWeights now have teeth, not just logging.
+  const budgetEntry = sessionBudget.get(key);
+  if (BUDGET_MAX && budgetEntry?.breachedAt) {
+    if (BUDGET_REJECT) {
+      res.writeHead(429, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: `session budget exceeded (${budgetEntry.cumulative.toFixed(2)} >= ${BUDGET_MAX})` }));
+      return;
+    }
+    // Downgrade to cheapest tier instead of rejecting
+    const cheapest = COMPLEXITY_LEVELS[0];
+    if (COMPLEXITY_LEVELS.indexOf(decision.complexity) > 0) {
+      console.warn(`[router] budget breached -> downgrading ${decision.complexity} to ${cheapest}`);
+      decision.complexity = cheapest;
+    }
+  }
+
   // Resolve backend: check for tools-fixed-model override, then normal routing
   let backend;
   if (hasTools && TOOLS_FIXED_MODEL) {
@@ -1638,8 +1876,74 @@ const server = http.createServer(async (req, res) => {
   );
   debugLog(`routing: ${JSON.stringify((text || "(no text)").slice(0, 80))} -> ${decision.complexity} -> ${backend.model} @ ${backend.baseUrl}`);
 
+  // Track cost for this turn
+  addSessionCost(key, costWeight);
+
   try {
     const upstream = await callBackend(backend, body, { stream: !!body.stream });
+
+    // Failure-based auto-escalation: on non-streaming responses, check
+    // for failure patterns and retry on a higher tier if allowed.
+    // For streaming, we can't inspect the body before forwarding, so
+    // escalation only triggers on HTTP errors or non-stream responses.
+    if (!body.stream && upstream.status === 200) {
+      const cloned = upstream.clone();
+      try {
+        const data = await cloned.json();
+        const textContent = (data.content || [])
+          .filter((b) => b.type === "text")
+          .map((b) => b.text)
+          .join("\n");
+        const isFailure = FAILURE_PATTERNS.some((p) => p.test(textContent));
+
+        if (isFailure) {
+          const escCount = sessionEscalations.get(key) || 0;
+          const currentIdx = COMPLEXITY_LEVELS.indexOf(decision.complexity);
+          if (escCount < MAX_ESCALATIONS_PER_SESSION && currentIdx < COMPLEXITY_LEVELS.length - 1) {
+            const escalated = COMPLEXITY_LEVELS[currentIdx + 1];
+            console.warn(`[router] failure detected -> auto-escalating ${decision.complexity} -> ${escalated}`);
+            sessionEscalations.set(key, escCount + 1);
+            // Retry with higher tier
+            const escBackend = resolveRoute(escalated);
+            const escBody = JSON.parse(JSON.stringify(body));
+            escBody.model = escBackend.model;
+            try {
+              const escUpstream = await callBackend(escBackend, escBody, { stream: false });
+              const escHeaders = { "content-type": escUpstream.headers.get("content-type") || "application/json" };
+              res.writeHead(escUpstream.status, escHeaders);
+              res.end(await escUpstream.text());
+              return;
+            } catch (escE) {
+              // Escalation failed too — fall through to send original response
+              console.warn(`[router] escalation also failed: ${escE.message}`);
+            }
+          }
+        }
+      } catch (_) { /* JSON parse failed — send original response */ }
+    }
+
+    // Upstream HTTP error that might benefit from escalation (5xx from cheap model)
+    if (upstream.status >= 500 && !body.stream) {
+      const escCount = sessionEscalations.get(key) || 0;
+      const currentIdx = COMPLEXITY_LEVELS.indexOf(decision.complexity);
+      if (escCount < MAX_ESCALATIONS_PER_SESSION && currentIdx < COMPLEXITY_LEVELS.length - 1) {
+        const escalated = COMPLEXITY_LEVELS[currentIdx + 1];
+        console.warn(`[router] upstream HTTP ${upstream.status} -> auto-escalating ${decision.complexity} -> ${escalated}`);
+        sessionEscalations.set(key, escCount + 1);
+        const escBackend = resolveRoute(escalated);
+        const escBody = JSON.parse(JSON.stringify(body));
+        escBody.model = escBackend.model;
+        try {
+          const escUpstream = await callBackend(escBackend, escBody, { stream: false });
+          const escHeaders = { "content-type": escUpstream.headers.get("content-type") || "application/json" };
+          res.writeHead(escUpstream.status, escHeaders);
+          res.end(await escUpstream.text());
+          return;
+        } catch (escE) {
+          console.warn(`[router] escalation also failed: ${escE.message}`);
+        }
+      }
+    }
 
     const headers = { "content-type": upstream.headers.get("content-type") || "application/json" };
     res.writeHead(upstream.status, headers);
@@ -1682,6 +1986,11 @@ server.listen(PORT, HOST, () => {
   console.log(`[router] classifier -> ${config.classifier.model} @ ${config.classifier.baseUrl}`);
   console.log(`[router] clarify=${CLARIFY_ENABLED}`);
   console.log(`[router] debug=${DEBUG ? "on (per-request trace)" : "off (set debug:true in config or DEBUG=1)"}`);
+  console.log(`[router] classifyCacheTtl=${CLASSIFY_CACHE_TTL_MS}ms heuristicPreFilter=enabled`);
+  if (BUDGET_MAX) console.log(`[router] budgetMax=${BUDGET_MAX} budgetReject=${BUDGET_REJECT}`);
+  else console.log(`[router] budgetMax=none (set budgetMax in config.json to enforce)`);
+  console.log(`[router] autoEscalation=enabled (max ${MAX_ESCALATIONS_PER_SESSION}/session, on failure patterns + 5xx)`);
+  console.log(`[router] compactHint=${COMPACT_HINT_TURNS > 0 ? `at ${COMPACT_HINT_TURNS} turns` : "disabled"} (set compactHintTurns in config.json to adjust)`);
   console.log(`[router] upstreamTimeout=${UPSTREAM_TIMEOUT_MS}ms maxSessions=${MAX_SESSIONS} maxBody=${(MAX_BODY_BYTES / (1024 * 1024)).toFixed(0)}MB`);
   console.log(`[router] tools.minComplexity=${TOOLS_MIN_COMPLEXITY}` +
     (TOOLS_FIXED_MODEL ? ` tools.model=${TOOLS_FIXED_MODEL}` : ""));

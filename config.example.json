@@ -34,11 +34,18 @@
     "super_hard": 1.00
   },
 
+  "budgetMax": null,
+  "budgetReject": false,
+
+  "compactHintTurns": 15,
+  "classifyCacheTtlMs": 60000,
+
   "baseUrl": "https://api.z.ai/api/anthropic",
   "apiKey": "YOUR_GLM_API_KEY",
 
   "classifier": {
-    "model": "glm-4.7-flash"
+    "model": "glm-4.7-flash",
+    "maxRetries": 3
   },
 
   "routes": {
