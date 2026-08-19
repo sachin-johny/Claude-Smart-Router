@@ -21,6 +21,14 @@ Anthropic Messages API — instead of you manually switching models.
    instructions without touching code.
 6. Supports **Ollama** as a free local classifier/backend, and Claude Code
    **OAuth tokens** (`sk-ant-oat...`) in addition to plain API keys.
+7. **Budget enforcement**: `budgetMax` caps a session's accumulated
+   cost-weight spend; breached sessions get downgraded to the cheapest tier
+   (or rejected with `budgetReject: true`) instead of burning expensive tiers.
+8. **Auto-escalation**: when the chosen upstream fails or 5xx's, the router
+   retries once on the next-smarter tier so you don't see the error.
+9. **GLM Coding Plan credit tracking**: real 5-hour and weekly plan-credit
+   accounting from actual usage, peak/off-peak rates, one-time hints, and a
+   `GET /credits` dashboard (see below).
 
 Zero npm dependencies — Node.js 18+ only (uses global `fetch`).
 
@@ -61,7 +69,7 @@ produces is byte-for-byte what `npm publish` uploads:
 
 ```bash
 npm pack                       # -> claude-smart-router-<version>.tgz
-npm install -g ./claude-smart-router-1.2.3.tgz
+npm install -g ./claude-smart-router-1.3.0.tgz
 ```
 
 You can also install straight from the checkout, no tarball needed:
@@ -74,7 +82,7 @@ Upgrading is the same command re-run — npm replaces the previous version.
 To check what's actually inside a tarball before installing:
 
 ```bash
-tar -tzf claude-smart-router-1.2.3.tgz
+tar -tzf claude-smart-router-1.3.0.tgz
 ```
 
 To remove it entirely:
@@ -104,8 +112,19 @@ as an explicit override. What it controls:
   providers.
 - `tools.minComplexity` — floor applied whenever a request has tool
   definitions attached (default `"medium"`).
-- `costWeights` — logged per-request for visibility; not enforced as a hard
-  budget in this version.
+- `costWeights` — relative token cost per tier, logged per-request and used
+  by `budgetMax` enforcement.
+- `budgetMax` / `budgetReject` — cap a session's accumulated cost-weight
+  spend. On breach, later requests from that session are downgraded to the
+  cheapest tier — or rejected outright when `budgetReject` is `true`.
+- `heuristic` (default `true`) — keyword pre-filter that skips the
+  classifier call for obviously easy/hard prompts. Set `false` to always
+  classify.
+- `classifyCacheTtlMs` (default `60000`) — cache classifications by message
+  text. Set `0` to disable.
+- `compactHintTurns` (default `15`) — inject a one-time hint suggesting
+  `/compact` after this many user turns in a session.
+- `credits` — GLM Coding Plan credit tracking (see below).
 - `routerToken` — optional. If set, the proxy requires
   `Authorization: Bearer <token>` on every request. Leave `null` for local
   single-user use.
@@ -129,6 +148,10 @@ You'll see something like:
 [router] classifier -> glm-4.7-flash @ https://api.z.ai/api/anthropic
 [router] clarify=true
 [router] routesTemplate=ROUTES.md (keyword mode)
+[router] budgetMax=none (set budgetMax in config.json to enforce)
+[router] autoEscalation=enabled (max 1/session, on failure patterns + 5xx)
+[router] compactHint=at 15 turns (set compactHintTurns in config.json to adjust)
+[router] credits: tracking GLM plan — 2000/5h + 10000/wk, warn at 80%, hints=on, off-peak=0.5x (peak Mon-Fri 14:00-18:00 UTC+8)
 ```
 
 ## Wiring into Claude Code (VS Code extension or CLI)
@@ -202,8 +225,11 @@ Set `ROUTER_ENV_PATH` if you want the env file somewhere other than next to
   deliberately set `0.0.0.0` (do that only together with `routerToken`).
 - `maxBodyMb` (default `20`) — request bodies larger than this are
   rejected with `413`.
-- `GET /health` — lightweight liveness endpoint (uptime + session count),
+- `GET /health` — lightweight liveness endpoint (uptime, session count,
+  escalation count, budget state, credit percentages, peak-hour flag),
   handy for process managers and uptime checks.
+- `GET /credits` — live GLM Coding Plan usage: 5h/weekly totals and
+  percentages, peak-hour state, and the next reset time (see below).
 - `GET /map` — inspect the current repo map (see below).
 - `POST /map/refresh` — rebuild the repo map cache. Call after `git pull`,
   reorg, or any time the cached map has gone stale.
@@ -356,6 +382,63 @@ When to use which:
   full input price every turn. Worth it for small maps you want in git.
 - **Both** (not recommended): double token cost, no additional benefit.
 
+## Budget enforcement & auto-escalation
+
+`budgetMax` (default `null` = off) turns `costWeights` from a visibility
+metric into a cap: each request adds its tier's weight to the session's
+running total, and once it crosses `budgetMax`, later requests from that
+session are re-routed to the cheapest tier — or rejected with
+`budgetReject: true`. A runaway session can no longer silently burn the
+expensive tiers.
+
+Auto-escalation covers the other direction: if the chosen upstream errors
+or returns a 5xx, the router retries once on the next-smarter tier
+(limited per session) instead of surfacing the failure. Escalated retries
+are billed to credit tracking too, since the plan charges for them.
+
+## Credit tracking (GLM Coding Plan)
+
+Tracks **real plan credits** — computed from the usage object upstream
+reports on every response (JSON bodies, SSE streams via a passive
+listener, and escalated retries), never estimated — against the Coding
+Plan's two windows:
+
+```json
+"credits": {
+  "enabled": true,
+  "plan": "lite",
+  "caps": { "fiveHour": 2000, "weekly": 10000 },
+  "weeklyResetAnchor": "2026-08-26T21:17:00+02:00",
+  "warnPct": 80,
+  "hints": true,
+  "peakHint": true,
+  "stateFile": "credits-state.json",
+  "multipliers": {
+    "glm-5.3": { "in": 6.9, "cached": 1.7, "out": 24 },
+    "glm-5-turbo": { "in": 5.7, "cached": 1.5, "out": 21 },
+    "glm-4.7": { "in": 4.6, "cached": 1.2, "out": 16 }
+  }
+}
+```
+
+- The **5-hour window** is a sliding ledger (credits replenish 5h after
+  they're spent). The **weekly window** follows the plan's fixed reset:
+  set `weeklyResetAnchor` to your reset time (shown on the Z.AI usage
+  page) and the router reports exact resets; without it the week is a
+  rolling 7 days (approximate).
+- **Peak hours** are Mon–Fri 14:00–18:00 UTC+8; everything else —
+  weekends and off-peak hours — bills at 0.5×. Peak state is computed
+  from UTC+8 regardless of the machine's timezone.
+- **No forced downgrades.** Crossing `warnPct` (default 80%) of either
+  window injects a one-time hint per session and logs a warning; a
+  peak-hours notice is injected once per session while hints are on. The
+  routing decision stays yours.
+- `GET /credits` returns the full snapshot; `/health` carries the
+  percentages. The ledger persists to `credits-state.json` (debounced,
+  flushed on shutdown), so restarts don't lose the weekly total.
+- Known blind spot: traffic that bypasses the router (Z.AI MCP tools,
+  direct API clients) is invisible — treat the numbers as a lower bound.
+
 ## Known limitations
 
 - Session tracking is approximated by hashing your system prompt + first
@@ -374,8 +457,24 @@ When to use which:
 - Classification looks at your latest message plus a short summary of
   recent assistant replies, not the full conversation — usually enough to
   judge complexity, but very context-dependent requests may be misjudged.
-- Cost weights are logged, not enforced — there's no hard budget cutoff.
 - Single-process; no clustering. Fine for a personal proxy's load.
+
+## Changes in 1.3.0
+
+- Budget enforcement: `budgetMax` / `budgetReject` give the logged cost
+  weights teeth — breached sessions downgrade to the cheapest tier or get
+  rejected.
+- Auto-escalation: upstream failures and 5xx trigger one retry on the
+  next-smarter tier (capped per session).
+- GLM Coding Plan credit tracking: 5-hour sliding + weekly anchored
+  windows, peak/off-peak 0.5× accounting, one-time hints, `GET /credits`,
+  and crash-safe ledger persistence.
+- Classifier optimizations: a keyword heuristic pre-filter and a
+  classification cache, both configurable (`heuristic`,
+  `classifyCacheTtlMs`) and off-capable for testing.
+- One-time `/compact` hint after `compactHintTurns` user turns.
+- Router shutdown no longer hangs on idle keep-alive sockets
+  (`server.closeIdleConnections()`).
 
 ## Changes from earlier version (fixes applied)
 
@@ -420,7 +519,7 @@ A few correctness issues were found and fixed in this pass:
    proper complexity→route mapping (`easy`→`light`, `medium`+→`heavy`).
 
 Issues #1–#5 were fixed before this pass; #6 and #7 were found by the test
-suite (`node test/run-tests.js` — 104 assertions across repo-map lifecycle, JSON mode, keyword
+suite (`node test/run-tests.js` — 124 assertions across credits, repo-map lifecycle, JSON mode, keyword
 mode, Ollama, fallbacks, env overrides, auth, and error paths; plus
 `node test/extra-probes.js` for gzip passthrough and concurrency).
 
@@ -446,7 +545,7 @@ node test/latency-probe.js glm-4.7 glm-5.2
 ```
 
 CI runs the full `npm test` suite on every push and PR across Node
-18/20/22 — see `.github/workflows/ci.yml`.
+20/22 — see `.github/workflows/ci.yml`.
 
 ## License
 
