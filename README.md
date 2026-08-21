@@ -71,7 +71,7 @@ produces is byte-for-byte what `npm publish` uploads:
 
 ```bash
 npm pack                       # -> claude-smart-router-<version>.tgz
-npm install -g ./claude-smart-router-1.5.0.tgz
+npm install -g ./claude-smart-router-1.6.0.tgz
 ```
 
 You can also install straight from the checkout, no tarball needed:
@@ -84,7 +84,7 @@ Upgrading is the same command re-run — npm replaces the previous version.
 To check what's actually inside a tarball before installing:
 
 ```bash
-tar -tzf claude-smart-router-1.5.0.tgz
+tar -tzf claude-smart-router-1.6.0.tgz
 ```
 
 To remove it entirely:
@@ -506,6 +506,30 @@ Plan's two windows:
   recent assistant replies, not the full conversation — usually enough to
   judge complexity, but very context-dependent requests may be misjudged.
 - Single-process; no clustering. Fine for a personal proxy's load.
+
+## Changes in 1.6.0 (readable upstream error logs)
+
+A bare `classifier HTTP 529` in the log tells you nothing at 2am —
+you end up grepping what the status means before knowing whether to
+wait it out, rotate a key, or fix a config path. (Debugging exactly
+such a 401 while setting up a separate classifier key is what
+prompted this.)
+
+- **`httpStatusHint()`** maps the statuses upstreams actually return to
+  a plain-language cause: 401 `auth failed — key invalid, expired, or
+  wrong provider`, 403 `forbidden — key lacks access to this model`,
+  404 `not found — wrong baseUrl or model name`, 429 `rate limited —
+  quota or RPM exceeded`, 529 `overloaded — upstream at capacity`, and
+  so on; unmapped 5xx fall back to `upstream error`.
+- Wired into every failure log site — the classifier retry lines, the
+  final throw (which the `triage failed (...)` warnings echo), ollama
+  errors, and the `upstream <- HTTP ...` debug trace — so failures now
+  read e.g. `triage failed (classifier HTTP 529 (overloaded — upstream
+  at capacity)), falling back`.
+- Success logs are unchanged — a 200 still logs as plain `HTTP 200`.
+- Test suite grows a stderr-tail capture helper and a test forcing
+  mock 529/401 classifier replies to pin the hint text (217
+  assertions, up from 213).
 
 ## Changes in 1.5.0 (classifier resilience + compact detection)
 
