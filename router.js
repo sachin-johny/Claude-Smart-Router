@@ -1279,12 +1279,13 @@ function isOAuthToken(apiKey) {
   return apiKey && apiKey.includes("sk-ant-oat");
 }
 
-// Human gloss for upstream HTTP statuses, appended to error and debug
-// logs. "classifier HTTP 529" at 2am tells the operator nothing; the
+// Human gloss for upstream HTTP statuses, appended to error, debug, and
+// success logs. "classifier HTTP 529" at 2am tells the operator nothing; the
 // hint says whether to wait it out (overloaded), fix a key (auth
 // failed), or change config (not found).
 function httpStatusHint(status) {
   const hints = {
+    200: "ok",
     400: "bad request",
     401: "auth failed — key invalid, expired, or wrong provider",
     403: "forbidden — key lacks access to this model",
@@ -1303,7 +1304,7 @@ function httpStatusHint(status) {
 }
 
 // "529 (overloaded — upstream at capacity)" for logs; the bare status
-// when there is nothing useful to add (200s, odd 3xx, ...).
+// when there is nothing useful to add (odd 3xx, unmapped codes, ...).
 function fmtHttpStatus(status) {
   const hint = httpStatusHint(status);
   return hint ? `${status} (${hint})` : String(status);

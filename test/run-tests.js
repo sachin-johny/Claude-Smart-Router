@@ -75,6 +75,9 @@ let mockProc = null;
 // Rolling tail of the router's stderr so tests can assert on warn text
 // (e.g. human-readable status hints) without parsing forwarded output.
 let stderrTail = "";
+// Same for stdout, where debugLog writes — kept silent (not echoed) so
+// DEBUG=1 tests don't flood the console, but assertable.
+let stdoutTail = "";
 
 function waitReady(proc, name, timeoutMs) {
   return new Promise((resolve, reject) => {
@@ -126,7 +129,9 @@ async function startRouter(configFile, env = {}) {
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
-  routerProc.stdout.on("data", () => {});
+  routerProc.stdout.on("data", (d) => {
+    stdoutTail = (stdoutTail + d.toString()).slice(-131072);
+  });
   routerProc.stderr.on("data", (d) => {
     process.stderr.write(`[router] ${d}`);
     stderrTail = (stderrTail + d.toString()).slice(-131072);
@@ -198,6 +203,14 @@ function clearRouterStderr() {
 
 function routerStderr() {
   return stderrTail;
+}
+
+function clearRouterStdout() {
+  stdoutTail = "";
+}
+
+function routerStdout() {
+  return stdoutTail;
 }
 
 // Control the mock backend's behavior (files it re-reads per request)
@@ -2001,11 +2014,14 @@ async function runTests() {
     });
     const p = path.join(LOG_DIR, "config-status-hint.json");
     fs.writeFileSync(p, JSON.stringify(cfg));
-    await startRouter(p, { ROUTES_PATH: NO_ROUTES });
+    // DEBUG=1 so the per-request `upstream <- HTTP ...` debug line is
+    // emitted (debugLog writes to stdout, hence the stdout tail).
+    await startRouter(p, { ROUTES_PATH: NO_ROUTES, DEBUG: "1" });
 
     // 529 is retryable: all 3 attempts fail, the final throw carries the hint.
     setClassifierFail(99, { status: 529 });
     clearRouterStderr();
+    clearRouterStdout();
     const r1 = await post("/v1/messages", msgBody({
       messages: [{ role: "user", content: "status hint five two nine unique" }],
     }));
@@ -2014,6 +2030,11 @@ async function runTests() {
       routerStderr().includes("classifier HTTP 529 (overloaded"),
       "529 fallback warn says 'overloaded'",
       routerStderr()
+    );
+    ok(
+      routerStdout().includes("upstream <- HTTP 200 (ok) from"),
+      "success debug line carries the 200 (ok) gloss",
+      routerStdout()
     );
 
     // 401 is not retryable: immediate throw, hint names the actual problem.
