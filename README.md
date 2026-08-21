@@ -71,7 +71,7 @@ produces is byte-for-byte what `npm publish` uploads:
 
 ```bash
 npm pack                       # -> claude-smart-router-<version>.tgz
-npm install -g ./claude-smart-router-1.3.0.tgz
+npm install -g ./claude-smart-router-1.4.0.tgz
 ```
 
 You can also install straight from the checkout, no tarball needed:
@@ -84,7 +84,7 @@ Upgrading is the same command re-run — npm replaces the previous version.
 To check what's actually inside a tarball before installing:
 
 ```bash
-tar -tzf claude-smart-router-1.3.0.tgz
+tar -tzf claude-smart-router-1.4.0.tgz
 ```
 
 To remove it entirely:
@@ -481,7 +481,7 @@ Plan's two windows:
   judge complexity, but very context-dependent requests may be misjudged.
 - Single-process; no clustering. Fine for a personal proxy's load.
 
-## Changes after 1.3.0 (security & robustness hardening)
+## Changes in 1.4.0 (security & robustness hardening)
 
 Applied from an external engineering + security review:
 
