@@ -71,7 +71,7 @@ produces is byte-for-byte what `npm publish` uploads:
 
 ```bash
 npm pack                       # -> claude-smart-router-<version>.tgz
-npm install -g ./claude-smart-router-1.6.0.tgz
+npm install -g ./claude-smart-router-1.6.1.tgz
 ```
 
 You can also install straight from the checkout, no tarball needed:
@@ -84,7 +84,7 @@ Upgrading is the same command re-run — npm replaces the previous version.
 To check what's actually inside a tarball before installing:
 
 ```bash
-tar -tzf claude-smart-router-1.6.0.tgz
+tar -tzf claude-smart-router-1.6.1.tgz
 ```
 
 To remove it entirely:
@@ -526,10 +526,24 @@ prompted this.)
   errors, and the `upstream <- HTTP ...` debug trace — so failures now
   read e.g. `triage failed (classifier HTTP 529 (overloaded — upstream
   at capacity)), falling back`.
-- Success logs are unchanged — a 200 still logs as plain `HTTP 200`.
+- Success logs were initially left bare here — 1.6.1 adds the gloss.
 - Test suite grows a stderr-tail capture helper and a test forcing
   mock 529/401 classifier replies to pin the hint text (217
   assertions, up from 213).
+
+## Changes in 1.6.1 (success lines get the gloss too)
+
+1.6.0 decorated every failure status but left the one line a healthy
+router prints on every request bare: `upstream <- HTTP 200 from
+glm-5`. Now it reads `upstream <- HTTP 200 (ok) from glm-5`, so
+success and failure lines scan the same way and a bare `HTTP 200`
+never appears in debug output.
+
+- `httpStatusHint()` grows a `200: "ok"` entry — the only success
+  status LLM upstreams actually return.
+- The test harness gains a stdout tail (debugLog writes to stdout,
+  warnings to stderr) and the hint test now runs with `DEBUG=1` to
+  pin the `200 (ok)` success line (218 assertions).
 
 ## Changes in 1.5.0 (classifier resilience + compact detection)
 
