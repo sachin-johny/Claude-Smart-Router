@@ -754,8 +754,27 @@ function checkCreditThresholds(now = Date.now()) {
 // crossing (usage is only known once a response completes); the peak
 // hint is known up-front, so it fires on the first request of any
 // session during peak hours. At most one hint per request.
-function maybeInjectCreditHints(key, firstUserIdx, messages) {
-  if (!CREDITS_ENABLED || !CREDITS_HINTS || firstUserIdx < 0) return;
+// SECURITY / CACHE NOTE: hints are appended to the LAST user message (not
+// the first). The first user message carries the byte-frozen repo-map
+// block (see "freeze" comments around line 380) — appending anything to
+// it on a later turn rewrites the cache-stable prefix and breaks the
+// prompt-cache hit on every subsequent turn. The compaction hint above
+// intentionally accepts a one-time cache break because it fires once per
+// session AND switches the injected variant (full → compact) at the same
+// time, so a single break is unavoidable. Credit hints have no such
+// excuse — they fire on whatever turn crosses a threshold, which can be
+// any turn, so they must live in the per-turn mutable tail.
+//
+// EDGE CASE: on the FIRST turn of a session (or any turn where the body
+// contains only one user message), lastUserIdx === firstUserIdx. Injecting
+// the hint there would still break byte-identity with later turns. We
+// defer the hint to the next turn that has a separate last user message —
+// the user still gets the warning early in the session (turn 2), just not
+// on the very first message. This is acceptable: the hint is a UX nudge,
+// not a correctness requirement.
+function maybeInjectCreditHints(key, lastUserIdx, firstUserIdx, messages) {
+  if (!CREDITS_ENABLED || !CREDITS_HINTS || lastUserIdx < 0) return;
+  if (lastUserIdx === firstUserIdx) return; // defer — would break byte-identity
   const done = sessionCreditHints.get(key) || new Set();
   sessionCreditHints.set(key, done);
   const snap = creditsSnapshot();
@@ -783,8 +802,8 @@ function maybeInjectCreditHints(key, firstUserIdx, messages) {
   }
 
   if (hint) {
-    appendTextToMessage(messages[firstUserIdx], "\n\n" + hint);
-    debugLog(`credits: injected ${[...done].pop()} hint into session ${key.slice(0, 10)}`);
+    appendTextToMessage(messages[lastUserIdx], "\n\n" + hint);
+    debugLog(`credits: injected ${[...done].pop()} hint into session ${key.slice(0, 10)} (last user msg #${lastUserIdx})`);
   }
 }
 const sessionCreditHints = new Map(); // sessionKey -> Set(hint kinds already sent)
@@ -983,8 +1002,28 @@ function readJsonBody(req, maxBytes) {
 function sessionKey(body) {
   const sys = typeof body.system === "string" ? body.system : JSON.stringify(body.system || "");
   const firstUserMsg = (body.messages || []).find((m) => m.role === "user");
-  const seed = sys.slice(0, 500) + JSON.stringify(firstUserMsg || {}).slice(0, 500);
-  return crypto.createHash("sha1").update(seed).digest("hex");
+  // SECURITY / COLLISION NOTE: the original seed was sys[0:500] +
+  // firstUserMsg[0:500]. Two unrelated Claude Code sessions in the same
+  // workspace share an almost-identical sys prompt (CLAUDE.md + tool
+  // list), so collisions reduced to "same first user message" — typing
+  // "refactor the auth module" twice on the same machine shared budget
+  // state, escalation counters, and repo-map bytes between the two
+  // sessions.
+  // We add body.metadata.user_id (Anthropic sends this on real Claude
+  // Code requests) — strong per-user separation WHEN AVAILABLE, no
+  // behavior change when absent (tests / mock clients don't send it,
+  // so the documented "same first message → same session" semantics
+  // used by the inheritance tests still hold).
+  // We deliberately do NOT mix in lastUserMsg or messages.length —
+  // the session-inheritance feature depends on a stable key across
+  // turns of the same conversation, and those fields change every turn.
+  // SHA-256 instead of SHA-1: not because collision-attack matters
+  // here (no adversary controls both inputs in a way that benefits
+  // from a collision), but because SHA-1 is deprecated and any future
+  // security audit will flag it.
+  const userId = (body.metadata && (body.metadata.user_id || body.metadata.session_id)) || "";
+  const seed = sys.slice(0, 500) + "\x1f" + JSON.stringify(firstUserMsg || {}).slice(0, 500) + "\x1f" + userId;
+  return crypto.createHash("sha256").update(seed).digest("hex");
 }
 
 // Index of the session's FIRST user message — the exact predicate
@@ -1812,7 +1851,16 @@ function checkAuth(req) {
   if (!ROUTER_TOKEN) return true; // auth not configured
   const auth = req.headers["authorization"] || "";
   const token = auth.startsWith("Bearer ") ? auth.slice(7) : auth;
-  return token === ROUTER_TOKEN;
+  if (!token) return false;
+  // Constant-time compare to prevent byte-by-byte timing leaks of the
+  // token via response latency. Length check is NOT constant-time, but
+  // revealing only the *length* of the expected token (not its bytes)
+  // is an acceptable trade-off — and timing-safe buffer compare on
+  // unequal-length inputs would throw.
+  const a = Buffer.from(token);
+  const b = Buffer.from(ROUTER_TOKEN);
+  if (a.length !== b.length) return false;
+  return crypto.timingSafeEqual(a, b);
 }
 
 // ---------------------------------------------------------------
@@ -1945,7 +1993,41 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (req.method !== "POST" || pathname !== "/v1/messages") {
-    // Passthrough anything else to the default backend, best-effort.
+    // SECURITY: allowlist the passthrough paths. Previously this branch
+    // concatenated `${baseUrl}${req.url}` for ANY path, which let a
+    // client escape the configured base path on the upstream host
+    // (e.g. "/../v1/account/billing" against a base of
+    // ".../api/anthropic" resolved to ".../api/v1/account/billing").
+    // That turned a /v1/messages-only proxy into a generic
+    // API-key-attaching forwarder — bad if the upstream is a multi-
+    // surface provider (Anthropic, OpenAI, etc.).
+    // Allowlist is conservative: only known-Anthropic non-chat endpoints
+    // that Claude Code actually uses. Add to it deliberately.
+    const PASSTHROUGH_ALLOWED = new Set([
+      "/v1/messages/count_tokens",
+      "/v1/messages/batches",
+      "/v1/messages/batches/{batch_id}",  // pattern — see note below
+      "/v1/models",  // GET — list available models (read-only, no secrets)
+    ]);
+    // DEFENSE-IN-DEPTH: reject any path containing ".." or "\" BEFORE
+    // the allowlist check. A traversal attempt like "/../v1/admin" would
+    // not match the allowlist anyway (-> 404), but reporting it as 400
+    // "traversal rejected" is more accurate and prevents a future
+    // allowlist expansion from accidentally admitting a traversal.
+    if (pathname.includes("..") || pathname.includes("\\")) {
+      res.writeHead(400, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: "path traversal rejected" }));
+      return;
+    }
+    // Static set check, plus a permissive pattern for batch IDs.
+    const isAllowed = PASSTHROUGH_ALLOWED.has(pathname) ||
+      /^\/v1\/messages\/batches\/[A-Za-z0-9_-]+$/.test(pathname);
+    if (!isAllowed) {
+      res.writeHead(404, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: `path not allowed in passthrough: ${pathname}` }));
+      return;
+    }
+    // Passthrough to the default backend, best-effort.
     try {
       const backend = resolveRoute("easy");
       const headers = {
@@ -2198,7 +2280,7 @@ const server = http.createServer(async (req, res) => {
   // peak-hours notice. Injected BEFORE the upstream call so this turn's
   // mutated body already carries it; threshold state comes from the
   // previous turn's recorded usage.
-  maybeInjectCreditHints(key, repoMapFirstIdx, body.messages);
+  maybeInjectCreditHints(key, index, repoMapFirstIdx, body.messages);
 
   // Budget enforcement: if session has breached budget, downgrade to cheapest
   // tier (or reject). This prevents a single runaway session from burning

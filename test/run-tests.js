@@ -1237,10 +1237,23 @@ async function runTests() {
       for (const messages of turns) await post("/v1/messages", msgBody({ messages }));
       const calls = chatCalls();
       eq(calls.length, 3, "three chat calls");
-      ok(!firstUserTextOf(calls[0]).includes("[router:"), "turn 1 has no hint (usage unknown yet)");
-      ok(firstUserTextOf(calls[1]).includes("5-hour GLM credit window"), "turn 2 carries the threshold hint");
+      // The hint lives in the LAST user message, not the first — the first
+      // user message carries the byte-frozen repo-map block (when enabled)
+      // and must stay cache-stable across turns. On turn 1 (single user
+      // message) the hint is deferred to avoid breaking that invariant.
+      const lastUserTextOf = (call) => {
+        const msgs = call.body.messages;
+        for (let i = msgs.length - 1; i >= 0; i--) {
+          if (msgs[i].role !== "user") continue;
+          const c = msgs[i].content;
+          return typeof c === "string" ? c : (Array.isArray(c) ? c.map((b) => b.text || "").join("") : "");
+        }
+        return "";
+      };
+      ok(!lastUserTextOf(calls[0]).includes("[router:"), "turn 1 has no hint (deferred — single user message)");
+      ok(lastUserTextOf(calls[1]).includes("5-hour GLM credit window"), "turn 2 carries the threshold hint (on last user msg)");
       eq(
-        (firstUserTextOf(calls[2]).match(/5-hour GLM credit window/g) || []).length,
+        (lastUserTextOf(calls[2]).match(/5-hour GLM credit window/g) || []).length,
         0,
         "turn 3 carries no repeat hint (client resends clean messages)"
       );

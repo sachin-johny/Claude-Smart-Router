@@ -16,7 +16,7 @@
   ],
   "scripts": {
     "start": "node router.js",
-    "test": "node test/run-tests.js && node test/extra-probes.js"
+    "test": "node test/run-tests.js && node test/security-tests.js && node test/extra-probes.js"
   },
   "engines": {
     "node": ">=18"
