@@ -246,13 +246,39 @@ Set `ROUTER_ENV_PATH` if you want the env file somewhere other than next to
 - `maxBodyMb` (default `20`) — request bodies larger than this are
   rejected with `413`.
 - `GET /health` — lightweight liveness endpoint (uptime, session count,
-  escalation count, budget state, credit percentages, peak-hour flag),
+  escalation count, budget state, credit percentages, peak-hour flag,
+  classifier circuit breaker state, in-flight count, and skip stats),
   handy for process managers and uptime checks.
 - `GET /credits` — live GLM Coding Plan usage: 5h/weekly totals and
   percentages, peak-hour state, and the next reset time (see below).
 - `GET /map` — inspect the current repo map (see below).
 - `POST /map/refresh` — rebuild the repo map cache. Call after `git pull`,
   reorg, or any time the cached map has gone stale.
+
+### Classifier resilience knobs (v1.4.0)
+
+All under `config.classifier.*`, safe defaults so existing configs work unchanged:
+
+- `maxRetries` (default `3`) — total classifier attempts.
+- `timeoutMs` (default `8000`) — per-attempt timeout, remote path only.
+- `ollamaTimeoutMs` (default `30000`) — separate knob for local models.
+- `deadlineMs` (default `15000`, capped at 25% of upstream) — hard
+  overall timeout for the classify phase.
+- `backoffBaseMs` (default `750`), `backoffMaxMs` (default `5000`),
+  `backoffJitter` (default `0.4`, ±40%) — retry delay computation.
+- `breakerThreshold` (default `3`, `0` disables) — consecutive failures
+  before the circuit breaker opens.
+- `breakerCooldownMs` (default `60000`) — cooldown before half-open probe.
+- `singleFlight` (default `true`) — dedupe identical in-flight prompts.
+- `titleGenSkip` (default `true`) — skip classifier for Claude Code
+  title-gen prompts (regex: `<session>...title`).
+- `titleGenPattern` — override the title-gen detection regex.
+- `compactSkip` (default `true`) — skip classifier for `/compact` prompts
+  (regex: `CRITICAL: Respond with TEXT ONLY`).
+- `compactPattern` — override the compact detection regex.
+- `compactHardMsgThreshold` (default `30`) — messages above this count
+  route `/compact` to `hard` instead of `medium` (larger context = harder
+  summarization).
 
 Config, `.env`, and `ROUTES.md` are resolved from the **current working
 directory** first, then next to `router.js` — so a global install finds
@@ -481,7 +507,9 @@ Plan's two windows:
   judge complexity, but very context-dependent requests may be misjudged.
 - Single-process; no clustering. Fine for a personal proxy's load.
 
-## Changes in 1.4.0 (security & robustness hardening)
+## Changes in 1.4.0 (security & robustness hardening + classifier resilience)
+
+### Security & robustness hardening
 
 Applied from an external engineering + security review:
 
@@ -523,6 +551,44 @@ Applied from an external engineering + security review:
   punctuation, and `.env` inline `# comments` are stripped.
 - New `test/security-tests.js` regression suite (auth, passthrough,
   session-key isolation) wired into `npm test`.
+
+### Classifier resilience (fixes flaky routing under load)
+
+When Claude Code fires a turn, 3 concurrent requests hit the same GLM
+key (real turn + 1–2 title-gen side-channels + classifier). The key's
+per-key RPM/burst limit trips with HTTP 429, and the classifier's
+original retry loop had no jitter, ignored `Retry-After`, didn't drain
+error bodies (holding HTTP/2 stream slots), lacked single-flight and a
+circuit breaker, and its catch block hardcoded `medium`. Result:
+thundering-herd retry storms, classifier failures, and cost regression
+(0.15 → 0.40) on recovery.
+
+Fix: config-overridable knobs (all defaults safe, existing configs work
+unchanged):
+
+- **Exponential backoff with ±40% jitter** — eliminates lockstep retry
+  storms; honors `Retry-After` header up to `backoffMaxMs`.
+- **Deadline-bounded retry loop** (`deadlineMs=15000`, capped at 25% of
+  upstream timeout) — per-attempt timeout reduced from 30s to 8s.
+- **Error body drained** via `res.body?.cancel()` on `!res.ok` — releases
+  HTTP/2 stream slots.
+- **Circuit breaker** (closed → open after 3 failures, half-open probe
+  after 60s) — prevents re-flooding an already-overloaded upstream.
+- **Single-flight dedupe** (`classifyInFlight` map) — byte-identical
+  in-flight prompts share one Promise (fixes title-gen duplicate calls).
+- **Smarter fallback chain** — prior session complexity → heuristic
+  (if enabled) → `medium` (last resort). Fixes the hardcode fallback.
+- **Title-gen skip** (`titleGenSkip=on`) — regex matches `<session>…</session>`
+  - `title` keyword, routes to `super_easy` without a classifier call.
+- **Compact skip** (`compactSkip=on`) — regex matches `CRITICAL: Respond
+  with TEXT ONLY`, routes to `medium` (or `hard` for >30 messages)
+  without a classifier call. Fixes non-deterministic /compact routing.
+- **Observability** — `/health` exposes breaker state, in-flight count,
+  skip stats (`singleFlightHits`, `breakerSkips`, `titleGenSkipped`,
+  `compactSkipped`). Startup logs all knobs.
+
+New `test/run-tests.js` resilience suite (14 tests, filterable via `node
+test/run-tests.js resilience`) proves each fix.
 
 ## Changes in 1.3.0
 
