@@ -16,7 +16,9 @@ Anthropic Messages API — instead of you manually switching models.
 4. **Auto-clarification**: genuinely ambiguous prompts get a short block of
    stated assumptions appended — your original message is never edited, and
    the note only appears on the turn that triggered it, not on every
-   follow-up afterward.
+   follow-up afterward. Assumptions coming back from the classifier are
+   sanitized first: anything resembling a tool invocation, file path, URL,
+   env var, or secret reference is dropped instead of appended.
 5. **Customizable classifier prompt** via `ROUTES.md` — edit the triage
    instructions without touching code.
 6. Supports **Ollama** as a free local classifier/backend, and Claude Code
@@ -126,8 +128,16 @@ as an explicit override. What it controls:
   `/compact` after this many user turns in a session.
 - `credits` — GLM Coding Plan credit tracking (see below).
 - `routerToken` — optional. If set, the proxy requires
-  `Authorization: Bearer <token>` on every request. Leave `null` for local
-  single-user use.
+  `Authorization: Bearer <token>` on every request (compared in constant
+  time). Leave `null` for local single-user use.
+- `rateLimit` — optional per-IP rate limit, e.g. `{ "rpm": 60 }`.
+  Requests are counted in a sliding 60s window with `burst` headroom
+  (default `rpm`/2); over the limit the proxy answers `429` with a
+  `retry-after` header. Off by default — enable it together with
+  `routerToken` when binding beyond loopback. `trustXff` (default
+  `false`) keys the limit off `X-Forwarded-For` instead of the socket
+  address; only enable it behind a reverse proxy you control, since
+  otherwise any client can spoof that header.
 
 Then run it:
 
@@ -147,6 +157,7 @@ You'll see something like:
 [router] super_hard -> glm-5.2 @ https://api.z.ai/api/anthropic
 [router] classifier -> glm-4.7-flash @ https://api.z.ai/api/anthropic
 [router] clarify=true
+[router] rateLimit=disabled (set rateLimit.rpm in config to enable)
 [router] routesTemplate=ROUTES.md (keyword mode)
 [router] budgetMax=none (set budgetMax in config.json to enforce)
 [router] autoEscalation=enabled (max 1/session, on failure patterns + 5xx)
@@ -190,7 +201,9 @@ classifier can see what a short reply like "yes" is actually replying to.
 Keys can live in a `.env` file (copy [.env.example](.env.example) to `.env`)
 instead of `config.json` — the router loads it automatically at startup, and
 the file is git-ignored. Real environment variables always win over `.env`
-values. Resolution order, later overrides earlier:
+values. Inline `# comments` are stripped from unquoted values
+(`KEY=value # note` → `value`), dotenv-style; quote a value to keep a
+literal `#`. Resolution order, later overrides earlier:
 
 1. `config.json` (`classifier.apiKey`, `routes.<tier>.apiKey`)
 2. `.env` file or environment: `ROUTE_API_KEY` → **every** tier's backend
@@ -222,7 +235,14 @@ Set `ROUTER_ENV_PATH` if you want the env file somewhere other than next to
   bypassing tier routing entirely.
 - `host` (default `127.0.0.1`) — address to bind. The proxy injects your
   API keys into upstream requests, so it stays loopback-only unless you
-  deliberately set `0.0.0.0` (do that only together with `routerToken`).
+  deliberately set `0.0.0.0` (do that only together with `routerToken`,
+  and add `rateLimit` for anything beyond a trusted LAN).
+- Non-`/v1/messages` requests pass through to the `easy` tier's backend
+  for an **allowlisted** set of Anthropic endpoints only
+  (`/v1/messages/count_tokens`, `/v1/messages/batches[/...]`,
+  `/v1/models`). Anything else gets a 404, and paths containing `..` or
+  `\` a 400 — the proxy refuses to act as a generic forwarder that
+  attaches your API key to arbitrary upstream paths.
 - `maxBodyMb` (default `20`) — request bodies larger than this are
   rejected with `413`.
 - `GET /health` — lightweight liveness endpoint (uptime, session count,
@@ -442,8 +462,10 @@ Plan's two windows:
 ## Known limitations
 
 - Session tracking is approximated by hashing your system prompt + first
-  message. Two unrelated sessions with an identical system prompt and first
-  message could share routing state. Fine for typical single-session use.
+  message, plus `metadata.user_id` when the client sends one (Claude Code
+  does), so different users never collide. Two sessions from the same user
+  with an identical system prompt and first message could still share
+  routing state. Fine for typical single-session use.
 - Repo-map re-injection assumes the upstream honors prompt caching. On a
   non-caching Anthropic-compatible endpoint, the map is charged at full
   input price on every request — lower `repoMap.maxTokens` if your
@@ -458,6 +480,49 @@ Plan's two windows:
   recent assistant replies, not the full conversation — usually enough to
   judge complexity, but very context-dependent requests may be misjudged.
 - Single-process; no clustering. Fine for a personal proxy's load.
+
+## Changes after 1.3.0 (security & robustness hardening)
+
+Applied from an external engineering + security review:
+
+- **Credit hints no longer break the prompt-cache prefix.** The 5-hour and
+  peak-hour hints are appended to the session's *last* user message (the
+  per-turn mutable tail) instead of the first, which carries the
+  byte-frozen repo-map block — previously turn 2 rewrote the cache-stable
+  prefix, so every later turn paid full input price for the map.
+- **Passthrough is allowlisted.** Only known Anthropic non-chat endpoints
+  forward to the upstream; other paths get a 404 and `..`/`\` traversal
+  attempts a 400. The proxy can no longer be steered into attaching your
+  API key to arbitrary upstream paths.
+- **Timing-safe `routerToken` comparison** (`crypto.timingSafeEqual`).
+- **Stronger session keys**: SHA-256, seeded with `metadata.user_id` when
+  present, so two users typing the same first message on one machine no
+  longer share budget/escalation/repo-map state.
+- **Per-IP rate limiting** via the new `rateLimit` config (`rpm`,
+  `burst`, `trustXff`) — off by default.
+- **Genericized upstream errors**: clients get `router: upstream call
+  failed` without the underlying `ECONNREFUSED host:port` detail; the
+  verbose error stays in the server log.
+- **Debug logs redact secrets** (`sk-ant-…`, `sk-…`, `ghp_…`, `AKIA…`,
+  `password=`/`api_key=`/`token=` assignments, `Bearer` JWTs) and log
+  request paths without query strings.
+- **Classifier prompt-injection defense**: the triage prompt treats the
+  user message as untrusted data, and classifier-returned assumptions are
+  sanitized (paths, URLs, env vars, secrets, and tool invocations are
+  dropped; capped at 200 chars and 4 items) before any clarification note
+  is appended.
+- **`credits-state.json` is written with mode `0600`**, matching the
+  keystore.
+- Smaller fixes: `structuredClone` instead of a JSON deep-clone round-trip,
+  explicit symlink skip in the repo-map walk, `.unref()`'d abort timers,
+  centralized eviction across all per-session maps (was a slow leak),
+  tightened failure-escalation patterns (long legitimate "I cannot
+  complete…" replies no longer burn a tier escalation), tightened the
+  `super_hard` keyword heuristic ("what is a design system?" no longer
+  routes to super_hard), keyword-mode clarity parsing tolerates trailing
+  punctuation, and `.env` inline `# comments` are stripped.
+- New `test/security-tests.js` regression suite (auth, passthrough,
+  session-key isolation) wired into `npm test`.
 
 ## Changes in 1.3.0
 
@@ -519,9 +584,9 @@ A few correctness issues were found and fixed in this pass:
    proper complexity→route mapping (`easy`→`light`, `medium`+→`heavy`).
 
 Issues #1–#5 were fixed before this pass; #6 and #7 were found by the test
-suite (`node test/run-tests.js` — 124 assertions across credits, repo-map lifecycle, JSON mode, keyword
-mode, Ollama, fallbacks, env overrides, auth, and error paths; plus
-`node test/extra-probes.js` for gzip passthrough and concurrency).
+suite (`node test/run-tests.js` — credits, repo-map lifecycle, JSON mode,
+keyword mode, Ollama, fallbacks, env overrides, auth, and error paths;
+plus `node test/extra-probes.js` for gzip passthrough and concurrency).
 
 ## Testing
 
@@ -531,9 +596,11 @@ npm test
 
 This runs `test/run-tests.js` (the main e2e suite — boots the router against
 mock Anthropic- and Ollama-shaped backends and asserts on what actually got
-forwarded) followed by `test/extra-probes.js` (gzip header-stripping and a
-20-way concurrency smoke test). Both spawn `test/mock-backends.js`
-automatically; you don't run it directly.
+forwarded), then `test/security-tests.js` (security regression gate:
+timing-safe auth, the passthrough allowlist, and session-key isolation),
+then `test/extra-probes.js` (gzip header-stripping and a 20-way concurrency
+smoke test). All of them spawn `test/mock-backends.js` automatically; you
+don't run it directly.
 
 `test/latency-probe.js` is a separate, manual one-off — it hits the real
 z.ai endpoint with a live API key to compare per-tier latency and is not
