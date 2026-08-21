@@ -193,6 +193,22 @@ function setReply(v) {
 function setTierStatus(v) {
   fs.writeFileSync(path.join(LOG_DIR, "TIER_STATUS"), String(v));
 }
+// Resilience-test controls. setClassifierFail writes a countdown: the
+// mock fails the next N classifier calls then resumes healthy replies.
+// status defaults to 429; retryAfter (seconds) is sent as Retry-After.
+function setClassifierFail(n, { status = 429, retryAfter = null } = {}) {
+  fs.writeFileSync(path.join(LOG_DIR, "CLASSIFIER_FAIL_N"), String(n));
+  fs.writeFileSync(path.join(LOG_DIR, "CLASSIFIER_STATUS"), String(status));
+  if (retryAfter !== null) fs.writeFileSync(path.join(LOG_DIR, "CLASSIFIER_RETRY_AFTER"), String(retryAfter));
+}
+function setClassifierDelay(ms) {
+  fs.writeFileSync(path.join(LOG_DIR, "CLASSIFIER_DELAY_MS"), String(ms));
+}
+function clearClassifierControls() {
+  for (const f of ["CLASSIFIER_FAIL_N", "CLASSIFIER_STATUS", "CLASSIFIER_RETRY_AFTER", "CLASSIFIER_DELAY_MS"]) {
+    fs.rmSync(path.join(LOG_DIR, f), { force: true });
+  }
+}
 
 function chatCalls() {
   return readLog().filter(
@@ -218,11 +234,11 @@ const TIER_MODELS = {
   super_hard: "tier-opus",
 };
 
-function buildConfig({ tools = {}, routes = TIER_MODELS, classifierModel = "classifier-flash", repoMap = { enabled: false }, heuristic = false, classifyCacheTtlMs = 0, rateLimit = null, debug = false, credits = null } = {}) {
+function buildConfig({ tools = {}, routes = TIER_MODELS, classifierModel = "classifier-flash", classifierOpts = null, repoMap = { enabled: false }, heuristic = false, classifyCacheTtlMs = 0, rateLimit = null, debug = false, credits = null } = {}) {
   const cfg = {
     port: ROUTER_PORT,
     tools,
-    classifier: { baseUrl: AN_BASE, apiKey: "test-key", model: classifierModel },
+    classifier: { baseUrl: AN_BASE, apiKey: "test-key", model: classifierModel, ...(classifierOpts || {}) },
     routes: Object.fromEntries(
       Object.entries(routes).map(([k, model]) => [
         k,
@@ -285,6 +301,7 @@ async function runTests() {
   // leave CLASSIFIER_REPLY behind, and the mock would serve the stale
   // reply to this run's first suites.
   fs.rmSync(path.join(LOG_DIR, "CLASSIFIER_REPLY"), { force: true });
+  clearClassifierControls();
   setTierStatus(200);
   await startMock();
 
@@ -1716,6 +1733,318 @@ async function runTests() {
       }
     }
     fs.rmSync(stateFile, { force: true });
+  });
+
+  // ---------------- suite: classifier resilience ----------------
+  // Each test starts a fresh router (breaker + in-flight state is
+  // per-process) and uses tight knobs (backoffBaseMs:40, timeoutMs:500,
+  // deadlineMs:1500) so the suite runs in seconds, not minutes.
+  // Filter: `node test/run-tests.js resilience` runs only this suite.
+  console.log("\n== suite: classifier resilience ==");
+
+  await test("resilience: single-flight dedupes identical concurrent prompts", async () => {
+    clearLog();
+    clearClassifierControls();
+    const cfg = buildConfig({
+      classifierModel: "classifier-flash",
+      classifierOpts: { singleFlight: true, backoffBaseMs: 40, timeoutMs: 1500, deadlineMs: 3000 },
+      classifyCacheTtlMs: 0, // isolate single-flight from cache
+    });
+    const p = path.join(LOG_DIR, "config-resilience-sf.json");
+    fs.writeFileSync(p, JSON.stringify(cfg));
+    await startRouter(p, { ROUTES_PATH: NO_ROUTES });
+    setReply(JSON.stringify({ complexity: "medium", clarity: "clear", assumptions: [] }));
+    setClassifierDelay(300); // hold the in-flight window open
+    try {
+      const body = msgBody({
+        messages: [{ role: "user", content: "test single-flight prompt that should be deduped xyz" }],
+      });
+      const [r1, r2] = await Promise.all([
+        post("/v1/messages", body),
+        post("/v1/messages", body),
+      ]);
+      eq(r1.status, 200, "r1 status 200");
+      eq(r2.status, 200, "r2 status 200");
+      eq(classifierCalls().length, 1, "exactly one classifier call (single-flight dedup)");
+    } finally {
+      clearClassifierControls();
+      await stopRouter();
+    }
+  });
+
+  await test("resilience: session-inheritance fallback on classifier failure", async () => {
+    clearLog();
+    clearClassifierControls();
+    const cfg = buildConfig({
+      classifierModel: "classifier-flash",
+      classifierOpts: { backoffBaseMs: 40, timeoutMs: 500, deadlineMs: 1500, breakerThreshold: 0 },
+    });
+    const p = path.join(LOG_DIR, "config-resilience-fb.json");
+    fs.writeFileSync(p, JSON.stringify(cfg));
+    await startRouter(p, { ROUTES_PATH: NO_ROUTES });
+
+    // Turn 1: classifier healthy, replies "hard". Session stores "hard".
+    setReply(JSON.stringify({ complexity: "hard", clarity: "clear", assumptions: [] }));
+    const r1 = await post("/v1/messages", msgBody({
+      messages: [{ role: "user", content: "Design a distributed consensus algorithm with formal proofs" }],
+    }));
+    eq(r1.status, 200, "turn 1 status 200");
+    ok(r1.text.includes("reply-from-tier-hard"), "turn 1 routed to tier-hard", r1.text);
+
+    // Turn 2: classifier fails all retries. Fallback should inherit
+    // "hard" (prior session complexity), NOT default to medium.
+    clearLog();
+    setClassifierFail(99, { status: 429 });
+    const r2 = await post("/v1/messages", msgBody({
+      messages: [
+        { role: "user", content: "Design a distributed consensus algorithm with formal proofs" },
+        { role: "assistant", content: "reply-from-tier-hard" },
+        { role: "user", content: "now add Byzantine fault tolerance to the algorithm carefully" },
+      ],
+    }));
+    eq(r2.status, 200, "turn 2 status 200");
+    ok(r2.text.includes("reply-from-tier-hard"), "turn 2 inherited tier-hard (not tier-medium)", r2.text);
+    await stopRouter();
+    clearClassifierControls();
+  });
+
+  await test("resilience: title-gen prompt skips classifier entirely", async () => {
+    clearLog();
+    clearClassifierControls();
+    const cfg = buildConfig({
+      classifierModel: "classifier-flash",
+      classifierOpts: { titleGenSkip: true },
+    });
+    const p = path.join(LOG_DIR, "config-resilience-tg.json");
+    fs.writeFileSync(p, JSON.stringify(cfg));
+    await startRouter(p, { ROUTES_PATH: NO_ROUTES });
+
+    const titleGenText =
+      "<session>\nwhat is the weather in mumbai india\n</session>\n\n" +
+      "Write the title in the predominant language of the session — " +
+      "a stray word or code token in another language doesn't change it.";
+    const r = await post("/v1/messages", msgBody({
+      messages: [{ role: "user", content: titleGenText }],
+      tools: null,
+    }));
+    eq(r.status, 200, "status 200");
+    eq(classifierCalls().length, 0, "zero classifier calls (title-gen skipped)");
+    ok(r.text.includes("reply-from-tier-flash"), "routed to tier-flash (super_easy)", r.text);
+    await stopRouter();
+  });
+
+  await test("resilience: title-gen negative gate — tools present still classifies", async () => {
+    clearLog();
+    clearClassifierControls();
+    const cfg = buildConfig({
+      classifierModel: "classifier-flash",
+      classifierOpts: { titleGenSkip: true },
+      heuristic: false,
+    });
+    const p = path.join(LOG_DIR, "config-resilience-tg-neg.json");
+    fs.writeFileSync(p, JSON.stringify(cfg));
+    await startRouter(p, { ROUTES_PATH: NO_ROUTES });
+    setReply(JSON.stringify({ complexity: "medium", clarity: "clear", assumptions: [] }));
+
+    const titleGenText =
+      "<session>\nwhat is the weather in mumbai india\n</session>\n\n" +
+      "Write the title in the predominant language of the session";
+    const r = await post("/v1/messages", msgBody({
+      messages: [{ role: "user", content: titleGenText }],
+      tools: TOOLS,
+    }));
+    eq(r.status, 200, "status 200");
+    ok(classifierCalls().length >= 1, "classifier called when tools present", `got ${classifierCalls().length}`);
+    await stopRouter();
+  });
+
+  await test("resilience: title-gen negative gate — multi-message turn still classifies", async () => {
+    clearLog();
+    clearClassifierControls();
+    const cfg = buildConfig({
+      classifierModel: "classifier-flash",
+      classifierOpts: { titleGenSkip: true },
+      heuristic: false,
+    });
+    const p = path.join(LOG_DIR, "config-resilience-tg-neg2.json");
+    fs.writeFileSync(p, JSON.stringify(cfg));
+    await startRouter(p, { ROUTES_PATH: NO_ROUTES });
+    setReply(JSON.stringify({ complexity: "medium", clarity: "clear", assumptions: [] }));
+
+    const titleGenText =
+      "<session>\nwhat is the weather in mumbai india\n</session>\n\n" +
+      "Write the title in the predominant language of the session";
+    const r = await post("/v1/messages", msgBody({
+      messages: [
+        { role: "user", content: "previous question about something" },
+        { role: "assistant", content: "previous answer about something" },
+        { role: "user", content: titleGenText },
+      ],
+    }));
+    eq(r.status, 200, "status 200");
+    ok(classifierCalls().length >= 1, "classifier called when multi-message turn", `got ${classifierCalls().length}`);
+    await stopRouter();
+  });
+
+  await test("resilience: breaker opens after threshold, skips classifier", async () => {
+    clearLog();
+    clearClassifierControls();
+    const cfg = buildConfig({
+      classifierModel: "classifier-flash",
+      classifierOpts: {
+        backoffBaseMs: 40, timeoutMs: 500, deadlineMs: 1500,
+        breakerThreshold: 2, breakerCooldownMs: 60_000,
+      },
+    });
+    const p = path.join(LOG_DIR, "config-resilience-br.json");
+    fs.writeFileSync(p, JSON.stringify(cfg));
+    await startRouter(p, { ROUTES_PATH: NO_ROUTES });
+    setClassifierFail(99, { status: 429 });
+
+    // Request A: fails all retries (3 internal classifier calls),
+    // breaker records 1 failure (still below threshold=2).
+    const r1 = await post("/v1/messages", msgBody({
+      messages: [{ role: "user", content: "breaker test prompt unique A" }],
+    }));
+    eq(r1.status, 200, "request A status 200");
+    const callsAfterA = classifierCalls().length;
+    eq(callsAfterA, 3, "request A: 3 classifier calls (internal retries)");
+
+    // Request B: fails all retries (3 more), breaker opens
+    // (failures=2 >= threshold=2).
+    const r2 = await post("/v1/messages", msgBody({
+      messages: [{ role: "user", content: "breaker test prompt unique B" }],
+    }));
+    eq(r2.status, 200, "request B status 200");
+    const callsAfterB = classifierCalls().length;
+    eq(callsAfterB, 6, "request B: 6 total classifier calls");
+
+    // Request C: breaker is open — no classifier call.
+    const r3 = await post("/v1/messages", msgBody({
+      messages: [{ role: "user", content: "breaker test prompt unique C" }],
+    }));
+    eq(r3.status, 200, "request C status 200");
+    eq(classifierCalls().length, callsAfterB, "request C: zero new classifier calls (breaker open)");
+
+    const health = await (await fetch(`http://localhost:${ROUTER_PORT}/health`)).json();
+    eq(health.classifyBreaker.state, "open", "breaker state open in /health");
+    await stopRouter();
+    clearClassifierControls();
+  });
+
+  await test("resilience: half-open probe after cooldown", async () => {
+    clearLog();
+    clearClassifierControls();
+    const cfg = buildConfig({
+      classifierModel: "classifier-flash",
+      classifierOpts: {
+        backoffBaseMs: 40, timeoutMs: 500, deadlineMs: 1500,
+        breakerThreshold: 2, breakerCooldownMs: 400,
+      },
+    });
+    const p = path.join(LOG_DIR, "config-resilience-ho.json");
+    fs.writeFileSync(p, JSON.stringify(cfg));
+    await startRouter(p, { ROUTES_PATH: NO_ROUTES });
+
+    // Open the breaker: 2 failed requests.
+    setClassifierFail(99, { status: 429 });
+    await post("/v1/messages", msgBody({
+      messages: [{ role: "user", content: "open breaker prompt 1 unique" }],
+    }));
+    await post("/v1/messages", msgBody({
+      messages: [{ role: "user", content: "open breaker prompt 2 unique" }],
+    }));
+    const callsBeforeWait = classifierCalls().length;
+    eq(callsBeforeWait, 6, "two failed requests = 6 classifier calls");
+
+    // Wait out the cooldown, then clear failures so the probe succeeds.
+    await new Promise((r) => setTimeout(r, 500));
+    clearClassifierControls();
+    setReply(JSON.stringify({ complexity: "medium", clarity: "clear", assumptions: [] }));
+
+    // Probe: classifier called exactly once, breaker closes on success.
+    const r = await post("/v1/messages", msgBody({
+      messages: [{ role: "user", content: "probe prompt after cooldown unique" }],
+    }));
+    eq(r.status, 200, "probe status 200");
+    eq(classifierCalls().length - callsBeforeWait, 1, "exactly 1 new classifier call (half-open probe)");
+
+    const health = await (await fetch(`http://localhost:${ROUTER_PORT}/health`)).json();
+    eq(health.classifyBreaker.state, "closed", "breaker state closed after probe success");
+    await stopRouter();
+    clearClassifierControls();
+  });
+
+  await test("resilience: Retry-After header honored on 429", async () => {
+    clearLog();
+    clearClassifierControls();
+    const cfg = buildConfig({
+      classifierModel: "classifier-flash",
+      classifierOpts: {
+        backoffBaseMs: 40, backoffMaxMs: 5_000,
+        timeoutMs: 1_500, deadlineMs: 8_000,
+        breakerThreshold: 0, // don't trip mid-test
+      },
+    });
+    const p = path.join(LOG_DIR, "config-resilience-ra.json");
+    fs.writeFileSync(p, JSON.stringify(cfg));
+    await startRouter(p, { ROUTES_PATH: NO_ROUTES });
+
+    // Fail once with Retry-After:1, then succeed.
+    setClassifierFail(1, { status: 429, retryAfter: "1" });
+    setReply(JSON.stringify({ complexity: "medium", clarity: "clear", assumptions: [] }));
+
+    const start = Date.now();
+    const r = await post("/v1/messages", msgBody({
+      messages: [{ role: "user", content: "retry-after honoring prompt unique" }],
+    }));
+    const elapsed = Date.now() - start;
+    eq(r.status, 200, "status 200 after retry");
+    // Retry-After:1s → first retry ~1000ms; with backoff floor of 750
+    // and ±40% jitter, lower bound is ~600ms.
+    ok(elapsed >= 600, `router waited >= 600ms before retry (got ${elapsed}ms)`, "");
+    eq(classifierCalls().length, 2, "exactly 2 classifier calls (1 fail + 1 success)");
+    await stopRouter();
+    clearClassifierControls();
+  });
+
+  await test("resilience: errors not cached — same prompt re-classified after recovery", async () => {
+    clearLog();
+    clearClassifierControls();
+    const cfg = buildConfig({
+      classifierModel: "classifier-flash",
+      classifierOpts: {
+        backoffBaseMs: 40, timeoutMs: 500, deadlineMs: 1500,
+        breakerThreshold: 0, // disable so the second call isn't blocked
+      },
+      classifyCacheTtlMs: 60_000, // cache ENABLED — proves errors aren't cached
+    });
+    const p = path.join(LOG_DIR, "config-resilience-nc.json");
+    fs.writeFileSync(p, JSON.stringify(cfg));
+    await startRouter(p, { ROUTES_PATH: NO_ROUTES });
+
+    const prompt = "unique error-caching test prompt xyz123 unique";
+    // Turn 1: classifier fails all retries → fallback (medium).
+    setClassifierFail(99, { status: 429 });
+    const r1 = await post("/v1/messages", msgBody({
+      messages: [{ role: "user", content: prompt }],
+    }));
+    eq(r1.status, 200, "turn 1 status 200");
+    ok(r1.text.includes("reply-from-tier-medium"), "turn 1 fell back to tier-medium", r1.text);
+
+    // Turn 2: classifier healthy. Same prompt should make a FRESH call
+    // (proving the failure wasn't cached), and route to tier-hard.
+    clearClassifierControls();
+    clearLog();
+    setReply(JSON.stringify({ complexity: "hard", clarity: "clear", assumptions: [] }));
+    const r2 = await post("/v1/messages", msgBody({
+      messages: [{ role: "user", content: prompt }],
+    }));
+    eq(r2.status, 200, "turn 2 status 200");
+    ok(r2.text.includes("reply-from-tier-hard"), "turn 2 routed to tier-hard (fresh call)", r2.text);
+    eq(classifierCalls().length, 1, "turn 2 made exactly 1 fresh classifier call");
+    await stopRouter();
+    clearClassifierControls();
   });
 
   // ---------------- summary ----------------

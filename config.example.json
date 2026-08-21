@@ -64,7 +64,18 @@
 
   "classifier": {
     "model": "glm-4.7-flash",
-    "maxRetries": 3
+    "maxRetries": 3,
+    "timeoutMs": 8000,
+    "ollamaTimeoutMs": 30000,
+    "deadlineMs": 15000,
+    "backoffBaseMs": 750,
+    "backoffMaxMs": 5000,
+    "backoffJitter": 0.4,
+    "breakerThreshold": 3,
+    "breakerCooldownMs": 60000,
+    "singleFlight": true,
+    "titleGenSkip": true,
+    "titleGenPattern": null
   },
 
   "routes": {

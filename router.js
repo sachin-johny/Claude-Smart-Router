@@ -1379,6 +1379,217 @@ async function callOllamaBackend(backend, body, timeoutMs) {
 }
 
 // ---------------------------------------------------------------
+// Classifier resilience knobs (overridable via config.classifier.*)
+// ---------------------------------------------------------------
+// Hoisted to module scope so they're read once at startup, matching
+// the CLASSIFY_CACHE_TTL_MS pattern above. All have safe defaults so
+// existing config.json files work unchanged.
+const CLS_CFG = config.classifier || {};
+const CLS_MAX_RETRIES       = Math.max(1, CLS_CFG.maxRetries ?? 3);    // total attempts; clamped >= 1
+const CLS_TIMEOUT_MS        = CLS_CFG.timeoutMs ?? 8_000;              // per-attempt, remote path (was 30s)
+const CLS_OLLAMA_TIMEOUT_MS = CLS_CFG.ollamaTimeoutMs ?? 30_000;      // local models keep 30s unless explicit
+const CLS_DEADLINE_MS       = Math.min(
+  CLS_CFG.deadlineMs ?? 15_000,
+  Math.floor((UPSTREAM_TIMEOUT_MS || 120_000) / 4)                    // never eat > 25% of upstream budget
+);
+const CLS_BACKOFF_BASE_MS   = CLS_CFG.backoffBaseMs ?? 750;
+const CLS_BACKOFF_MAX_MS    = CLS_CFG.backoffMaxMs ?? 5_000;
+const CLS_BACKOFF_JITTER    = CLS_CFG.backoffJitter ?? 0.4;           // ±40%
+const CLS_BREAKER_THRESHOLD   = CLS_CFG.breakerThreshold ?? 3;        // 0 disables breaker
+const CLS_BREAKER_COOLDOWN_MS = CLS_CFG.breakerCooldownMs ?? 60_000;
+const CLS_SINGLE_FLIGHT     = CLS_CFG.singleFlight !== false;         // default true
+const CLS_TITLEGEN_SKIP     = CLS_CFG.titleGenSkip !== false;         // default true
+
+// Title-gen detection. Claude Code wraps the session text in
+// <session>…</session> and appends a "Write the title in the
+// predominant language" instruction. The <session> wrapper is a
+// stable protocol artifact; the prose around "predominant language"
+// is template copy that can change between CC versions. Require BOTH
+// signals so a future CC prose update doesn't silently break this.
+// Adversarial exposure (forcing super_easy via the wrapper) is the
+// same class as the existing greetings heuristic; disable via
+// classifier.titleGenSkip: false.
+const CLS_TITLEGEN_RE_DEFAULT = /^<session>\n[\s\S]*?\n<\/session>\n[\s\S]{0,200}title/i;
+let CLS_TITLEGEN_RE = CLS_TITLEGEN_RE_DEFAULT;
+if (typeof CLS_CFG.titleGenPattern === "string") {
+  try {
+    CLS_TITLEGEN_RE = new RegExp(CLS_CFG.titleGenPattern, "i");
+  } catch (e) {
+    console.warn(`[router] classifier.titleGenPattern invalid, using default: ${e.message}`);
+    CLS_TITLEGEN_RE = CLS_TITLEGEN_RE_DEFAULT;
+  }
+}
+
+// ---------------------------------------------------------------
+// Classifier resilience helpers
+// ---------------------------------------------------------------
+
+// Parse HTTP Retry-After header. Accepts integer seconds ("120")
+// or HTTP-date ("Wed, 21 Oct 2026 07:28:00 GMT"). Returns ms,
+// 0 if absent/invalid. Capped at backoffMaxMs by the caller so a
+// server demanding a 60s backoff fails fast to fallback instead of
+// stalling the upstream budget.
+function parseRetryAfterMs(value) {
+  if (!value) return 0;
+  const s = String(value).trim();
+  if (/^\d+$/.test(s)) {
+    const n = parseInt(s, 10);
+    return Number.isFinite(n) ? n * 1000 : 0;
+  }
+  const dt = Date.parse(s);
+  return Number.isFinite(dt) ? Math.max(0, dt - Date.now()) : 0;
+}
+
+// Compute retry delay = max(exponential backoff, retry-after) ± jitter,
+// clamped to [1ms, CLS_BACKOFF_MAX_MS]. Without jitter, N concurrent
+// callers that 429 at the same instant retry in lockstep and re-429
+// — the thundering-herd pattern observed in production logs.
+function computeRetryDelayMs(attempt, retryAfterMs = 0) {
+  const exp = CLS_BACKOFF_BASE_MS * Math.pow(2, attempt);
+  let delay = Math.max(exp, retryAfterMs);
+  if (CLS_BACKOFF_JITTER > 0) {
+    const j = (Math.random() * 2 - 1) * CLS_BACKOFF_JITTER * delay;
+    delay = delay + j;
+  }
+  return Math.max(1, Math.min(delay, CLS_BACKOFF_MAX_MS));
+}
+
+// Circuit breaker state. Closed → open after threshold consecutive
+// failures. Open → half-open after cooldown (one probe call allowed).
+// Half-open → closed on success, back to open on failure.
+// Per-process (resets on restart) — fine for a local proxy: an open
+// breaker means up to cooldownMs of inherited/heuristic/medium routing,
+// which is the desired degradation.
+const classifierBreaker = {
+  state: "closed",         // closed | open | half-open
+  failures: 0,
+  openedAt: 0,
+  probeInFlight: false,
+};
+
+function breakerAllowsCall() {
+  if (CLS_BREAKER_THRESHOLD <= 0) return true; // breaker disabled
+  if (classifierBreaker.state === "closed") return true;
+  if (classifierBreaker.state === "open") {
+    const elapsed = Date.now() - classifierBreaker.openedAt;
+    if (elapsed >= CLS_BREAKER_COOLDOWN_MS) {
+      classifierBreaker.state = "half-open";
+      classifierBreaker.probeInFlight = true;
+      console.warn(`[router] classifier breaker: half-open (probing)`);
+      return true;
+    }
+    return false;
+  }
+  // half-open: the transition above already dispatched the one probe;
+  // every other caller (concurrent or sequential) falls back so we
+  // don't re-flood the just-recovered upstream while it's being tested.
+  return false;
+}
+
+function breakerRecordResult(ok) {
+  if (CLS_BREAKER_THRESHOLD <= 0) return;
+  if (ok) {
+    if (classifierBreaker.state !== "closed") {
+      console.warn(`[router] classifier breaker: closed (recovered)`);
+    }
+    classifierBreaker.state = "closed";
+    classifierBreaker.failures = 0;
+    classifierBreaker.probeInFlight = false;
+    return;
+  }
+  classifierBreaker.failures++;
+  if (classifierBreaker.state === "half-open") {
+    classifierBreaker.state = "open";
+    classifierBreaker.openedAt = Date.now();
+    classifierBreaker.probeInFlight = false;
+    console.warn(`[router] classifier breaker: OPEN (half-open probe failed)`);
+    return;
+  }
+  if (classifierBreaker.failures >= CLS_BREAKER_THRESHOLD) {
+    classifierBreaker.state = "open";
+    classifierBreaker.openedAt = Date.now();
+    console.warn(
+      `[router] classifier breaker: OPEN (failures=${classifierBreaker.failures}, ` +
+      `cooldown=${CLS_BREAKER_COOLDOWN_MS}ms)`
+    );
+  }
+}
+
+function breakerSnapshot() {
+  return {
+    state: classifierBreaker.state,
+    failures: classifierBreaker.failures,
+    openedAgoMs: classifierBreaker.openedAt ? Date.now() - classifierBreaker.openedAt : 0,
+  };
+}
+
+// Single-flight dedupe: identical in-flight prompts share one Promise.
+// Two byte-identical title-gen calls (same CC session) previously each
+// fired their own fetch and 429'd in lockstep — this collapses them
+// to one. Errors are NOT cached here (each caller sees the rejection);
+// only completed results reach classifyCache.
+const classifyInFlight = new Map();
+const classifyStats = {
+  singleFlightHits: 0,
+  breakerSkips: 0,
+  titleGenSkipped: 0,
+  fallbackSession: 0,
+  fallbackHeuristic: 0,
+  fallbackMedium: 0,
+};
+
+async function fetchClassifierText(cacheKey, payload) {
+  if (CLS_SINGLE_FLIGHT && classifyInFlight.has(cacheKey)) {
+    classifyStats.singleFlightHits++;
+    debugLog(`classifier single-flight: joining in-flight call (key=${cacheKey.slice(0, 8)})`);
+    return classifyInFlight.get(cacheKey);
+  }
+  const flight = (async () => {
+    if (!breakerAllowsCall()) {
+      classifyStats.breakerSkips++;
+      throw new Error("classifier circuit breaker open");
+    }
+    try {
+      const text = await callClassifier(payload);
+      breakerRecordResult(true);
+      return text;
+    } catch (e) {
+      breakerRecordResult(false);
+      throw e;
+    }
+  })();
+  if (CLS_SINGLE_FLIGHT) {
+    classifyInFlight.set(cacheKey, flight);
+    flight.finally(() => classifyInFlight.delete(cacheKey)).catch(() => {});
+  }
+  return flight;
+}
+
+// Fallback chain when the classifier is unavailable. Ordered by
+// correctness-per-cost:
+//   1. prior session complexity (free, correct for ~95% of multi-turn sessions)
+//   2. heuristic pre-filter result (free, conservative — only if enabled)
+//   3. medium (last resort — preserves old behavior)
+function classifierFallback(userText, contextSummary, priorComplexity) {
+  if (priorComplexity && COMPLEXITY_LEVELS.includes(priorComplexity)) {
+    classifyStats.fallbackSession++;
+    return { complexity: priorComplexity, clarity: "clear", assumptions: [], source: "fallback-session" };
+  }
+  // Only consult the heuristic if it's enabled in config — callers that
+  // set "heuristic": false opted out, and routing their fallback through
+  // heuristicClassify would silently re-enable it.
+  if (HEURISTIC_ENABLED) {
+    const h = heuristicClassify(userText, contextSummary);
+    if (h) {
+      classifyStats.fallbackHeuristic++;
+      return { ...h, source: "fallback-heuristic" };
+    }
+  }
+  classifyStats.fallbackMedium++;
+  return { complexity: "medium", clarity: "clear", assumptions: [], source: "fallback-medium" };
+}
+
+// ---------------------------------------------------------------
 // Classifier call (supports Anthropic API + Ollama local)
 // ---------------------------------------------------------------
 
@@ -1406,7 +1617,7 @@ async function callClassifier(payload) {
       options: { temperature: 0, num_predict: 300 },
     };
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 30_000);
+    const timer = setTimeout(() => controller.abort(), CLS_OLLAMA_TIMEOUT_MS);
     timer.unref();
     try {
       const res = await fetch(ollamaUrl, {
@@ -1435,15 +1646,22 @@ async function callClassifier(payload) {
     headers["x-api-key"] = backend.apiKey;
   }
 
-  // Retry with exponential backoff on rate-limit (429/529/503) errors.
+  // Retry with backoff on rate-limit (429/529/503) and transient errors.
   // The classifier is on the hot path — a transient 529 shouldn't force
-  // every request to default to medium. Up to 3 attempts: 0s, 1s, 2s.
-  const MAX_CLASSIFIER_RETRIES = config.classifier?.maxRetries ?? 3;
+  // every request to default to medium. Bounded by CLS_DEADLINE_MS so
+  // the classify phase can't eat more than ~25% of the upstream budget.
+  // Retry-After is honored up to backoffMaxMs and within deadline — a
+  // server demanding 60s fails fast to fallback instead of stalling.
   const RETRYABLE_STATUS = new Set([429, 503, 529, 520, 524]);
+  const deadlineEnd = Date.now() + CLS_DEADLINE_MS;
 
-  for (let attempt = 0; attempt < MAX_CLASSIFIER_RETRIES; attempt++) {
+  for (let attempt = 0; attempt < CLS_MAX_RETRIES; attempt++) {
+    const remaining = deadlineEnd - Date.now();
+    if (remaining <= 0) throw new Error("classifier deadline exceeded");
+
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 30_000);
+    const attemptTimeout = Math.min(CLS_TIMEOUT_MS, remaining);
+    const timer = setTimeout(() => controller.abort(), attemptTimeout);
     timer.unref();
     try {
       const res = await fetch(url, {
@@ -1453,11 +1671,24 @@ async function callClassifier(payload) {
         signal: controller.signal,
       });
       if (!res.ok) {
-        if (RETRYABLE_STATUS.has(res.status) && attempt < MAX_CLASSIFIER_RETRIES - 1) {
-          const delay = attempt * 1000; // 0, 1s, 2s
-          debugLog(`classifier HTTP ${res.status}, retry ${attempt + 1}/${MAX_CLASSIFIER_RETRIES} in ${delay}ms`);
+        // Drain the body so the underlying socket can be reused.
+        // Under HTTP/2 an undrained error body keeps the stream slot
+        // occupied, worsening head-of-line blocking on the next retry.
+        try { await res.body?.cancel(); } catch (_) { /* ignore */ }
+
+        const retryAfterMs = parseRetryAfterMs(res.headers.get("retry-after"));
+        if (RETRYABLE_STATUS.has(res.status) && attempt < CLS_MAX_RETRIES - 1) {
+          const delay = computeRetryDelayMs(attempt, retryAfterMs);
+          const wouldFinishAt = Date.now() + delay;
+          if (wouldFinishAt >= deadlineEnd) {
+            throw new Error(`classifier HTTP ${res.status} (retry would exceed deadline)`);
+          }
+          debugLog(
+            `classifier HTTP ${res.status}, retry ${attempt + 1}/${CLS_MAX_RETRIES} in ${Math.round(delay)}ms` +
+            (retryAfterMs ? ` (retry-after=${Math.round(retryAfterMs)}ms)` : "")
+          );
           clearTimeout(timer);
-          if (delay > 0) await new Promise((r) => setTimeout(r, delay));
+          await new Promise((r) => setTimeout(r, delay));
           continue;
         }
         throw new Error(`classifier HTTP ${res.status}`);
@@ -1469,10 +1700,18 @@ async function callClassifier(payload) {
         .join("")
         .trim();
     } catch (e) {
-      // AbortError or network error — retry if attempts remain
-      if (attempt < MAX_CLASSIFIER_RETRIES - 1 && (e.name === "AbortError" || e.message.includes("ECONN"))) {
-        const delay = (attempt + 1) * 1000;
-        debugLog(`classifier error: ${e.message}, retry ${attempt + 1}/${MAX_CLASSIFIER_RETRIES} in ${delay}ms`);
+      // AbortError (timeout) or network error — retry with the same
+      // jittered backoff as the HTTP-error path so all callers in a
+      // burst don't retry in lockstep (the original (attempt+1)*1000
+      // schedule was asymmetric with the !res.ok branch and produced
+      // synchronized retry storms).
+      if (attempt < CLS_MAX_RETRIES - 1 && (e.name === "AbortError" || e.message.includes("ECONN"))) {
+        const delay = computeRetryDelayMs(attempt, 0);
+        const wouldFinishAt = Date.now() + delay;
+        if (wouldFinishAt >= deadlineEnd) {
+          throw new Error(`classifier ${e.name || "network error"} (retry would exceed deadline)`);
+        }
+        debugLog(`classifier error: ${e.message}, retry ${attempt + 1}/${CLS_MAX_RETRIES} in ${Math.round(delay)}ms`);
         clearTimeout(timer);
         await new Promise((r) => setTimeout(r, delay));
         continue;
@@ -1533,7 +1772,7 @@ function heuristicClassify(userText, contextSummary) {
   return null;
 }
 
-async function triage(userText, systemPrompt, contextSummary) {
+async function triage(userText, systemPrompt, contextSummary, priorComplexity = null) {
   const sysSnippet = typeof systemPrompt === "string"
     ? systemPrompt.slice(0, 800)
     : JSON.stringify(systemPrompt || "").slice(0, 800);
@@ -1555,7 +1794,7 @@ async function triage(userText, systemPrompt, contextSummary) {
 
     const { prompt } = buildTriagePrompt(userText, sysSnippet, contextSummary);
     try {
-      const resultText = await callClassifier({
+      const resultText = await fetchClassifierText(cacheKey, {
         model: config.classifier.model,
         max_tokens: 50,
         temperature: 0,
@@ -1589,8 +1828,8 @@ async function triage(userText, systemPrompt, contextSummary) {
       setCachedClassification(cacheKey, result);
       return result;
     } catch (e) {
-      console.warn(`[router] triage failed, defaulting to medium/clear: ${e.message}`);
-      return { complexity: "medium", clarity: "clear", assumptions: [] };
+      console.warn(`[router] triage failed (${e.message}), falling back`);
+      return classifierFallback(userText, contextSummary, priorComplexity);
     }
   }
 
@@ -1655,7 +1894,7 @@ async function triage(userText, systemPrompt, contextSummary) {
   }
 
   try {
-    const raw = await callClassifier(triageBody);
+    const raw = await fetchClassifierText(jsonCacheKey, triageBody);
     debugLog(`classifier (${config.classifier.model}) replied: ${JSON.stringify(raw.slice(0, 300))}`);
     const cleaned = raw.replace(/^```json\s*|^```\s*|```$/gm, "").trim();
     const parsed = JSON.parse(cleaned);
@@ -1670,8 +1909,8 @@ async function triage(userText, systemPrompt, contextSummary) {
     setCachedClassification(jsonCacheKey, result);
     return result;
   } catch (e) {
-    console.warn(`[router] triage failed, defaulting to medium/clear: ${e.message}`);
-    return { complexity: "medium", clarity: "clear", assumptions: [] };
+    console.warn(`[router] triage failed (${e.message}), falling back`);
+    return classifierFallback(userText, contextSummary, priorComplexity);
   }
 }
 
@@ -2228,6 +2467,14 @@ const server = http.createServer(async (req, res) => {
         sessions: sessionBackend.size,
         classifyCacheSize: classifyCache.size,
         classifyCacheTtlMs: CLASSIFY_CACHE_TTL_MS,
+        classifyBreaker: breakerSnapshot(),
+        classifyInFlight: classifyInFlight.size,
+        classifySingleFlightHits: classifyStats.singleFlightHits,
+        classifyBreakerSkips: classifyStats.breakerSkips,
+        classifyTitleGenSkips: classifyStats.titleGenSkipped,
+        classifyFallbackSession: classifyStats.fallbackSession,
+        classifyFallbackHeuristic: classifyStats.fallbackHeuristic,
+        classifyFallbackMedium: classifyStats.fallbackMedium,
         budgetMax: BUDGET_MAX,
         budgetBreachedSessions: budgetBreached,
         totalEscalations,
@@ -2461,14 +2708,35 @@ const server = http.createServer(async (req, res) => {
       classifiedComplexity = "super_easy";
     }
   } else {
-    // Try heuristic pre-filter first (saves a classifier call for obvious cases)
-    const heuristic = HEURISTIC_ENABLED ? heuristicClassify(text, contextSummary) : null;
     let t;
-    if (heuristic) {
-      t = heuristic;
-      debugLog(`heuristic pre-filter: ${text.slice(0,60)} -> ${t.complexity} (${t.source})`);
+    // Title-gen detection: Claude Code wraps the session in <session>…</session>
+    // and asks for a title. This is structurally always super_easy, and
+    // skipping the classifier call avoids ~30% of total classifier load
+    // (every CC turn fires 1-2 of these as a side-channel). Disable via
+    // classifier.titleGenSkip: false.
+    const isTitleGen = CLS_TITLEGEN_SKIP &&
+      !hasTools &&
+      (body.messages || []).length === 1 &&
+      CLS_TITLEGEN_RE.test(text);
+    if (isTitleGen) {
+      t = { complexity: "super_easy", clarity: "clear", assumptions: [], source: "titlegen" };
+      classifyStats.titleGenSkipped++;
+      debugLog(`title-gen request detected -> super_easy (no classifier call)`);
     } else {
-      t = await triage(text, body.system, contextSummary);
+      // Try heuristic pre-filter first (saves a classifier call for obvious cases)
+      const heuristic = HEURISTIC_ENABLED ? heuristicClassify(text, contextSummary) : null;
+      if (heuristic) {
+        t = heuristic;
+        debugLog(`heuristic pre-filter: ${text.slice(0,60)} -> ${t.complexity} (${t.source})`);
+      } else {
+        // Prior session complexity is the cheapest correct fallback when
+        // the classifier is unavailable — multi-turn sessions rarely
+        // change complexity between adjacent turns.
+        const priorComplexity = sessionBackend.has(key)
+          ? sessionBackend.get(key).complexity
+          : null;
+        t = await triage(text, body.system, contextSummary, priorComplexity);
+      }
     }
     decision = { complexity: t.complexity, assumptions: t.clarity === "ambiguous" ? t.assumptions : [] };
     classifiedComplexity = t.complexity;
@@ -2765,6 +3033,18 @@ server.listen(PORT, HOST, () => {
   console.log(`[router] clarify=${CLARIFY_ENABLED}`);
   console.log(`[router] debug=${DEBUG ? "on (per-request trace)" : "off (set debug:true in config or DEBUG=1)"}`);
   console.log(`[router] classifyCacheTtl=${CLASSIFY_CACHE_TTL_MS}ms heuristicPreFilter=enabled`);
+  console.log(
+    `[router] classifier: retries=${CLS_MAX_RETRIES} timeoutMs=${CLS_TIMEOUT_MS} ` +
+    `deadlineMs=${CLS_DEADLINE_MS} backoff=${CLS_BACKOFF_BASE_MS}-${CLS_BACKOFF_MAX_MS}ms ` +
+    `jitter=±${Math.round(CLS_BACKOFF_JITTER * 100)}% singleFlight=${CLS_SINGLE_FLIGHT ? "on" : "off"} ` +
+    `titleGenSkip=${CLS_TITLEGEN_SKIP ? "on" : "off"}`
+  );
+  console.log(
+    `[router] classifier: breaker=${CLS_BREAKER_THRESHOLD > 0 ? `threshold=${CLS_BREAKER_THRESHOLD} cooldown=${CLS_BREAKER_COOLDOWN_MS}ms` : "disabled"}`
+  );
+  if (CLS_TIMEOUT_MS > CLS_DEADLINE_MS) {
+    console.warn(`[router] classifier: timeoutMs (${CLS_TIMEOUT_MS}) > deadlineMs (${CLS_DEADLINE_MS}); deadline will cap per-attempt budget`);
+  }
   if (BUDGET_MAX) console.log(`[router] budgetMax=${BUDGET_MAX} budgetReject=${BUDGET_REJECT}`);
   else console.log(`[router] budgetMax=none (set budgetMax in config.json to enforce)`);
   console.log(`[router] autoEscalation=enabled (max ${MAX_ESCALATIONS_PER_SESSION}/session, on failure patterns + 5xx)`);

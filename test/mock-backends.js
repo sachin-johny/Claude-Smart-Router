@@ -89,6 +89,42 @@ function makeAnthropicServer() {
     });
 
     if (isClassifierCall) {
+      // Optional delay to exercise single-flight: the delay window is
+      // the in-flight period during which a second identical prompt
+      // should join the first call rather than fire its own fetch.
+      const delayMs = parseInt(readControl("CLASSIFIER_DELAY_MS", "0"), 10) || 0;
+      if (delayMs > 0) await new Promise((r) => setTimeout(r, delayMs));
+
+      // Countdown failure mode: fail the next N classifier calls, then
+      // resume healthy replies. The file is rewritten on every read so
+      // concurrent calls from the router each decrement independently
+      // (which is what we want to test — without that, the mock would
+      // serve stale state to a concurrent caller and the test wouldn't
+      // exercise the router's actual concurrency behavior).
+      const failNRaw = readControl("CLASSIFIER_FAIL_N", null);
+      let failRemaining = 0;
+      if (failNRaw !== null) {
+        failRemaining = Math.max(0, parseInt(failNRaw, 10) || 0);
+        if (failRemaining > 0) {
+          try {
+            fs.writeFileSync(path.join(LOG_DIR, "CLASSIFIER_FAIL_N"), String(failRemaining - 1));
+          } catch (_) { /* ignore */ }
+        }
+      }
+
+      if (failRemaining > 0) {
+        const status = parseInt(readControl("CLASSIFIER_STATUS", "429"), 10) || 429;
+        const retryAfter = readControl("CLASSIFIER_RETRY_AFTER", null);
+        const headers = { "content-type": "application/json" };
+        if (retryAfter !== null) headers["retry-after"] = String(retryAfter);
+        res.writeHead(status, headers);
+        res.end(JSON.stringify({
+          type: "error",
+          error: { type: "rate_limit_error", message: `mock classifier fail ${failRemaining}` },
+        }));
+        return;
+      }
+
       let reply = readControl("CLASSIFIER_REPLY", DEFAULT_CLASSIFIER_REPLY);
       // keyword:super_hard -> reply with the bare keyword (ROUTES.md mode)
       if (reply.startsWith("keyword:")) reply = reply.slice("keyword:".length);
