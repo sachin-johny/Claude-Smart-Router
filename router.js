@@ -213,9 +213,20 @@ function resolveFile(explicit, basename) {
   for (const line of raw.split(/\r?\n/)) {
     const m = line.match(/^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$/);
     if (!m) continue; // blank line or # comment
-    const [, key, val] = m;
+    let [, key, val] = m;
     if (process.env[key] !== undefined) continue; // real env / keystore win
-    process.env[key] = val.replace(/^["']|["']$/g, "");
+    // Strip inline comments: `KEY=value # comment` -> `value`.
+    // Quotes protect the # so `KEY="pass#word"` keeps the # in the value.
+    // Match dotenv's behavior: only an unquoted ` #` (space-hash) starts
+    // an inline comment. Without this, a trailing `# my key` annotation
+    // becomes part of the value and the upstream rejects it with 401.
+    if (/^[^"']/.test(val)) {
+      // Value is not quoted — strip from the first " #" onward.
+      const hashIdx = val.indexOf(" #");
+      if (hashIdx >= 0) val = val.slice(0, hashIdx);
+    }
+    val = val.trim().replace(/^["']|["']$/g, "");
+    process.env[key] = val;
   }
   console.log(`[router] loaded env vars from ${envPath}`);
 })();
@@ -342,7 +353,35 @@ const DEBUG =
   ["1", "true", "yes"].includes((process.env.DEBUG || "").toLowerCase());
 
 function debugLog(...args) {
-  if (DEBUG) console.log("[router:debug]", ...args);
+  if (!DEBUG) return;
+  // SECURITY (S7): user prompts and upstream reply snippets logged below
+  // can contain pasted API keys, passwords, or PII ("here, store this
+  // token: sk-ant-..."). Redact obvious secret-looking substrings before
+  // they hit stdout/logs/journald. The patterns are conservative — they
+  // match the common vendor prefixes (Anthropic sk-ant-, OpenAI sk-,
+  // GitHub ghp_, AWS AKIA, plus generic password=... assignments).
+  // False positives (a code snippet that legitimately contains "sk-")
+  // are acceptable — debug logging is opt-in via DEBUG=1 and the user
+  // would prefer an over-redacted log over a leaked key in journald.
+  const SECRET_PATTERNS = [
+    /\bsk-ant-[A-Za-z0-9_-]{10,}/g,            // Anthropic
+    /\bsk-[A-Za-z0-9_-]{20,}(?![A-Za-z0-9_-])/g, // OpenAI (length-gated to avoid matching sk-ant-)
+    /\bghp_[A-Za-z0-9]{20,}/g,                  // GitHub PAT
+    /\bgho_[A-Za-z0-9]{20,}/g,                  // GitHub OAuth
+    /\bAKIA[0-9A-Z]{16}/g,                      // AWS access key id
+    /\bpassword\s*[:=]\s*\S+/gi,                // password=foo
+    /\bapi[_-]?key\s*[:=]\s*\S+/gi,             // api_key=foo
+    /\btoken\s*[:=]\s*\S+/gi,                   // token=foo
+    /\bsecret\s*[:=]\s*\S+/gi,                  // secret=foo
+    /\bbearer\s+[A-Za-z0-9._-]{10,}/gi,        // Bearer <jwt-ish>
+  ];
+  const redact = (v) => {
+    if (typeof v !== "string") return v;
+    let s = v;
+    for (const re of SECRET_PATTERNS) s = s.replace(re, "[REDACTED]");
+    return s;
+  };
+  console.log("[router:debug]", ...args.map(redact));
 }
 
 // Optional proxy auth: if routerToken is set in config, all requests
@@ -473,9 +512,38 @@ const COST_WEIGHTS = config.costWeights || {
 // Budget enforcement: track cumulative cost per session.
 // If budgetMax is set in config, sessions exceeding it get downgraded
 // to the cheapest tier (or rejected if budgetReject=true).
+//
+// SESSION MAP REGISTRY: every per-session Map below must be registered
+// here so eviction stays consistent. Without this, bumping MAX_SESSIONS
+// (e.g. to 5000) would let sessionBackend grow correctly but leave
+// sessionBudget / sessionEscalations / sessionCompactedHint /
+// sessionCreditHints stuck at their old implicit cap or growing
+// unbounded — a slow memory leak that only surfaces after weeks of
+// uptime. Register once at module load; evictOldestAcrossSessionMaps()
+// walks the list from setSession().
+const SESSION_MAPS = [];
+function registerSessionMap(m, name) {
+  SESSION_MAPS.push({ map: m, name });
+  return m;
+}
+function evictOldestAcrossSessionMaps(exceptKey) {
+  for (const { map, name } of SESSION_MAPS) {
+    if (map.size <= MAX_SESSIONS) continue;
+    let oldest = null;
+    for (const k of map.keys()) {
+      if (k === exceptKey) continue;
+      oldest = k;
+      break;
+    }
+    if (oldest !== null) {
+      map.delete(oldest);
+      debugLog(`session eviction: removed oldest from ${name} (size was > ${MAX_SESSIONS})`);
+    }
+  }
+}
 const BUDGET_MAX = config.budgetMax ?? null;     // e.g. 10.0 = 10x medium-equivalent
 const BUDGET_REJECT = config.budgetReject ?? false; // true = 429 on budget breach
-const sessionBudget = new Map(); // key -> { cumulative, breachedAt }
+const sessionBudget = registerSessionMap(new Map(), "sessionBudget"); // key -> { cumulative, breachedAt }
 
 function addSessionCost(key, costWeight) {
   const entry = sessionBudget.get(key) || { cumulative: 0, breachedAt: null };
@@ -492,14 +560,45 @@ function addSessionCost(key, costWeight) {
 // broken output (empty, malformed tool calls, error messages), retry
 // on the next-higher tier. Capped at 1 escalation per session to
 // prevent loops.
+//
+// PATTERNS MUST BE TIGHT: the assistant legitimately says things like
+// "I cannot complete this task until you provide X" — that's a correct
+// user-facing message, not a model failure. Auto-escalating on it would
+// (a) waste a tier, and (b) burn the per-session escalation counter on
+// a non-failure, leaving the session unable to recover from a real
+// failure later. Each pattern here must be specific enough to fire only
+// on actual model-side breakage, not on a polite refusal or a clarifying
+// question. When in doubt, prefer a tool-context anchor (e.g. require
+// "tool_use" or "tool_result" near the failure verb).
 const FAILURE_PATTERNS = [
-  /error:\s*(tool_use|tool_result|invalid|malformed)/i,
-  /i cannot (?:complete|fulfill|perform|execute)/i,
-  /(?:failed|unable) to (?:parse|execute|run|call)/i,
-  /tool_use.*malformed/i,
+  /error:\s*(tool_use|tool_result|invalid|malformed)/i, // explicit error markers tied to tools
+  /tool_use.*malformed/i, // tool-use schema breakage
+  /malformed (?:tool_use|tool_result|json|response)/i, // explicit "malformed X"
+  /(?:failed|unable) to (?:parse|execute|run|call)\b/i, // verbs about *its own* execution
+  // "I cannot X" only counts as a failure when X is a model-side action
+  // AND the reply is short (typical for a model that hit a limit, not a
+  // real refusal that explains why). The length guard is enforced at
+  // match time, not here — see isFailureResponse() below.
+  /i cannot (?:complete|fulfill|perform|execute) (?:this|the|that|your) (?:task|request|action|operation)/i,
 ];
 const MAX_ESCALATIONS_PER_SESSION = 1;
-const sessionEscalations = new Map(); // key -> count
+const sessionEscalations = registerSessionMap(new Map(), "sessionEscalations"); // key -> count
+
+// Length-guarded failure check. A real model-side failure tends to be
+// SHORT — the model emitted a stock "I cannot complete this task" or a
+// raw error string and stopped. A legitimate assistant reply that just
+// happens to contain the phrase (e.g. "I cannot complete this task
+// until you provide X, but here's a partial sketch: ...") is usually
+// long because it explains the situation. We use 400 chars as the
+// cutoff — generous enough that a real refusal-with-explanation stays
+// above it, tight enough that a bare model breakage stays below.
+//
+// Returns true iff a failure pattern matches AND textContent is short.
+function isFailureResponse(textContent) {
+  if (!textContent || typeof textContent !== "string") return false;
+  if (textContent.length > 400) return false; // long reply → not a failure
+  return FAILURE_PATTERNS.some((p) => p.test(textContent));
+}
 
 // Compaction hint: the router can't call Claude Code's /compact directly
 // (it's a client-side CLI command), but it CAN inject a one-time hint
@@ -507,7 +606,7 @@ const sessionEscalations = new Map(); // key -> count
 // this to the user. Configurable threshold; set compactHintTurns to 0
 // to disable.
 const COMPACT_HINT_TURNS = config.compactHintTurns ?? 15;
-const sessionCompactedHint = new Map(); // key -> true (hinted already)
+const sessionCompactedHint = registerSessionMap(new Map(), "sessionCompactedHint"); // key -> true (hinted already)
 
 // ---------------------------------------------------------------
 // Sticky session map: lets us skip re-classifying tool-result
@@ -515,7 +614,7 @@ const sessionCompactedHint = new Map(); // key -> true (hinted already)
 // (from alexrudloff/llmrouter's context-inheritance pattern).
 // ---------------------------------------------------------------
 
-const sessionBackend = new Map();
+const sessionBackend = registerSessionMap(new Map(), "sessionBackend");
 
 // ---------------------------------------------------------------
 // Classification cache: avoid re-classifying identical prompts
@@ -806,7 +905,7 @@ function maybeInjectCreditHints(key, lastUserIdx, firstUserIdx, messages) {
     debugLog(`credits: injected ${[...done].pop()} hint into session ${key.slice(0, 10)} (last user msg #${lastUserIdx})`);
   }
 }
-const sessionCreditHints = new Map(); // sessionKey -> Set(hint kinds already sent)
+const sessionCreditHints = registerSessionMap(new Map(), "sessionCreditHints"); // sessionKey -> Set(hint kinds already sent)
 
 // Observe a streamed SSE response without interfering with it: a second
 // 'data' listener alongside pipe() receives the same chunks. The
@@ -884,7 +983,16 @@ function saveCreditState() {
   try {
     pruneCreditEvents();
     const p = creditsStatePath();
-    fs.writeFileSync(p + ".tmp", JSON.stringify({ v: 1, events: creditEvents, warnLevels: creditWarnLevels }));
+    // SECURITY (S8): write with mode 0600 — the keystore uses 0600 and
+    // credits-state.json deserves the same: it contains per-session
+    // usage metadata (timestamps + credit costs) that could reveal
+    // usage patterns. The tmp file gets the same mode because the
+    // atomic rename carries the inode (and thus the mode) over.
+    fs.writeFileSync(
+      p + ".tmp",
+      JSON.stringify({ v: 1, events: creditEvents, warnLevels: creditWarnLevels }),
+      { mode: 0o600 }
+    );
     fs.renameSync(p + ".tmp", p);
   } catch (e) {
     console.warn(`[router] credits: state save failed: ${e.message}`);
@@ -1053,6 +1161,9 @@ function firstUserMessageIndex(messages) {
 
 // LRU-ish cap on sessionBackend: evict the oldest entry when
 // the map exceeds MAX_SESSIONS to prevent unbounded memory growth.
+// Sibling session maps are kept in sync via evictOldestAcrossSessionMaps()
+// (defined above, near SESSION_MAPS) so a bump to MAX_SESSIONS doesn't
+// leak sessionBudget / sessionEscalations / etc.
 function setSession(key, decision) {
   // Refresh recency: Map.set on an existing key does NOT move it, so
   // without the delete a long-running active session could be evicted
@@ -1064,6 +1175,8 @@ function setSession(key, decision) {
     const oldest = sessionBackend.keys().next().value;
     sessionBackend.delete(oldest);
   }
+  // Keep sibling per-session maps bounded too.
+  evictOldestAcrossSessionMaps(key);
 }
 
 // Extract text from the most recent user turn. Also returns
@@ -1129,10 +1242,11 @@ function extractContextSummary(messages, maxChars = 800) {
       let text = "";
       if (typeof m.content === "string") text = m.content;
       else if (Array.isArray(m.content)) {
-        // For user messages, skip tool_result blocks (they're noise)
-        const blocks = m.role === "user"
-          ? m.content.filter((b) => b.type === "text")
-          : m.content.filter((b) => b.type === "text");
+        // For user messages, skip tool_result blocks (they're noise).
+        // For assistant messages, all text blocks are content — but
+        // filtering by type==="text" is still correct (and the same
+        // filter), so a single branch is clearer than a dead ternary.
+        const blocks = m.content.filter((b) => b.type === "text");
         text = blocks.map((b) => b.text).join(" ");
       }
       if (text && text.trim()) {
@@ -1147,6 +1261,17 @@ function extractContextSummary(messages, maxChars = 800) {
 
 function wordCount(s) {
   return (s.match(/\S+/g) || []).length;
+}
+
+// Deep-clone a /v1/messages body. structuredClone (Node 17+) is faster
+// than JSON.parse(JSON.stringify()) and preserves non-JSON types if
+// they ever appear in the body. JSON fallback is defensive only — every
+// Node version since 17 has structuredClone as a global.
+function deepClone(obj) {
+  if (typeof globalThis.structuredClone === "function") {
+    return globalThis.structuredClone(obj);
+  }
+  return JSON.parse(JSON.stringify(obj));
 }
 
 // Detect OAuth tokens (sk-ant-oat*) from alexrudloff/llmrouter
@@ -1179,6 +1304,7 @@ async function callBackend(backend, body, { stream, timeoutMs } = {}) {
   const url = `${baseUrl}/v1/messages`;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs || UPSTREAM_TIMEOUT_MS);
+  timer.unref(); // don't hold the event loop open for an in-flight upstream
 
   const headers = {
     "content-type": "application/json",
@@ -1217,7 +1343,7 @@ async function callOllamaBackend(backend, body, timeoutMs) {
   const url = backend.baseUrl.replace(/\/$/, "") + "/api/chat";
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs || UPSTREAM_TIMEOUT_MS);
-
+  timer.unref();
   // Convert Anthropic messages → Ollama format
   const ollamaMessages = [];
   if (body.system) {
@@ -1281,6 +1407,7 @@ async function callClassifier(payload) {
     };
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 30_000);
+    timer.unref();
     try {
       const res = await fetch(ollamaUrl, {
         method: "POST",
@@ -1317,6 +1444,7 @@ async function callClassifier(payload) {
   for (let attempt = 0; attempt < MAX_CLASSIFIER_RETRIES; attempt++) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 30_000);
+    timer.unref();
     try {
       const res = await fetch(url, {
         method: "POST",
@@ -1691,6 +1819,16 @@ function buildRepoMap() {
       if (repoMapBytes >= maxBytes) { budgetHit = true; return; }
       // Skip dotfiles (but allow the root itself, which we entered via path.resolve)
       if (ent.name.startsWith(".") && ent.name !== ".") continue;
+      // SECURITY: explicitly skip symlinks. On Linux, fs.readdirSync
+      // with withFileTypes:true reports symlinks via isSymbolicLink()
+      // (NOT isDirectory()/isFile()), so they were already silently
+      // skipped — but only by accident. Make it explicit so a future
+      // contributor doesn't "fix" the dead branch by treating symlinks
+      // as files: a symlink inside the project that points outside
+      // (e.g. `node_modules-link -> /etc` or `secrets -> ~/.ssh`)
+      // would otherwise be walked and its target's exports exfiltrated
+      // into the repo map that gets injected into the prompt.
+      if (ent.isSymbolicLink && ent.isSymbolicLink()) continue;
       const full = path.join(dir, ent.name);
       const rel = path.relative(root, full);
       if (ent.isDirectory()) {
@@ -1929,6 +2067,62 @@ function buildCompactBlockText(mapText) {
 // Proxy auth check
 // ---------------------------------------------------------------
 
+// S4: simple per-IP rate limit. Defaults OFF (rateLimit: null in
+// config) — set {"rateLimit": {"rpm": 60}} to cap each source IP at 60
+// requests per minute. Sliding window per IP, evicted alongside other
+// session maps via the SESSION_MAPS registry so it stays bounded.
+//
+// Why per-IP and not per-token: this proxy is loopback-bound by
+// default, so "IP" is the caller's loopback address. When exposed via
+// 0.0.0.0 with routerToken, IP is still the only signal available
+// before auth (the token is in the request body or Authorization
+// header, available after we read the body — too late for a cheap
+// pre-auth rate limit). For per-token limits, wrap a real reverse
+// proxy (nginx, caddy) in front.
+const RATE_LIMIT_CFG = config.rateLimit || null;
+const RATE_LIMIT_RPM = RATE_LIMIT_CFG?.rpm || 0; // 0 = disabled
+// NOTE: use ?? (nullish coalescing) not || (logical or) so an explicit
+// burst: 0 is honored — `burst || default` would treat 0 as falsy and
+// silently substitute the default, defeating users who want zero burst.
+const RATE_LIMIT_BURST = RATE_LIMIT_CFG?.burst ?? Math.ceil(RATE_LIMIT_RPM / 2);
+const rateLimitBuckets = RATE_LIMIT_RPM > 0
+  ? registerSessionMap(new Map(), "rateLimitBuckets")
+  : null;
+
+function checkRateLimit(req) {
+  if (!rateLimitBuckets) return { allowed: true };
+  // x-forwarded-for only trusted if explicitly enabled in config — by
+  // default the proxy doesn't trust XFF because a public-facing
+  // deployment without a reverse proxy in front would let any client
+  // spoof its IP via the header. With a trusted reverse proxy in
+  // front, set rateLimit.trustXff: true.
+  const trustXff = RATE_LIMIT_CFG?.trustXff === true;
+  const ip = (trustXff && req.headers["x-forwarded-for"])
+    ? String(req.headers["x-forwarded-for"]).split(",")[0].trim()
+    : req.socket.remoteAddress || "unknown";
+  const now = Date.now();
+  const windowMs = 60_000;
+  const maxInWindow = RATE_LIMIT_RPM + RATE_LIMIT_BURST;
+  let bucket = rateLimitBuckets.get(ip);
+  if (!bucket) {
+    bucket = { hits: [], blockedUntil: 0 };
+    rateLimitBuckets.set(ip, bucket);
+  }
+  // Drop timestamps older than the window.
+  bucket.hits = bucket.hits.filter((t) => now - t < windowMs);
+  if (bucket.blockedUntil > now) {
+    return { allowed: false, retryAfterSec: Math.ceil((bucket.blockedUntil - now) / 1000) };
+  }
+  if (bucket.hits.length >= maxInWindow) {
+    // Block for 5s as a back-off — burst abusers cool off faster than
+    // a steady-state limiter would let them.
+    bucket.blockedUntil = now + 5_000;
+    return { allowed: false, retryAfterSec: 5 };
+  }
+  bucket.hits.push(now);
+  return { allowed: true };
+}
+
 function checkAuth(req) {
   if (!ROUTER_TOKEN) return true; // auth not configured
   const auth = req.headers["authorization"] || "";
@@ -1980,17 +2174,40 @@ function resolveRoute(complexity) {
 // ---------------------------------------------------------------
 
 const server = http.createServer(async (req, res) => {
-  debugLog(`<- ${req.method} ${req.url}`);
+  // SECURITY: log the pathname only, not req.url — some Anthropic SDK
+  // clients put the API key in the URL as ?key=sk-ant-..., which would
+  // land in stdout/logs/journald verbatim. The pathname is enough for
+  // debugging routing decisions.
+  const pathname = (req.url || "").split("?")[0];
+  debugLog(`<- ${req.method} ${pathname}`);
 
   // Dispatch on the path only — Claude Code appends query strings
   // (e.g. /v1/messages?beta=true), and an exact-string match would
   // silently dump those into the un-routed passthrough branch.
-  const pathname = (req.url || "").split("?")[0];
+  // (pathname computed above, reused here.)
 
   // Proxy auth gate
   if (!checkAuth(req)) {
     res.writeHead(401, { "content-type": "application/json" });
     res.end(JSON.stringify({ error: "unauthorized" }));
+    return;
+  }
+
+  // S4: per-IP rate limit (no-op when rateLimit.rpm is 0 / unset).
+  // Apply AFTER auth so unauthenticated requests can't fill the buckets
+  // and DOS legitimate ones — they 401 before reaching here. /health
+  // and / are NOT exempt: a determined attacker could just hammer /health
+  // instead, and the limit is cheap.
+  const rl = checkRateLimit(req);
+  if (!rl.allowed) {
+    res.writeHead(429, {
+      "content-type": "application/json",
+      "retry-after": String(rl.retryAfterSec || 5),
+    });
+    res.end(JSON.stringify({
+      error: "rate limit exceeded",
+      retry_after: rl.retryAfterSec || 5,
+    }));
     return;
   }
 
@@ -2171,7 +2388,15 @@ const server = http.createServer(async (req, res) => {
     } catch (e) {
       const status = e.statusCode === 413 ? 413 : 502;
       res.writeHead(status, { "content-type": "application/json" });
-      res.end(JSON.stringify({ error: e.statusCode === 413 ? `request body exceeds ${MAX_BODY_BYTES} bytes` : e.message }));
+      // SECURITY (S2): don't echo e.message to the client — fetch errors
+      // can contain internal hostnames/IPs. Log server-side, send a
+      // generic message to the client.
+      console.error(`[router] passthrough error: ${e.message}`);
+      res.end(JSON.stringify({
+        error: e.statusCode === 413
+          ? `request body exceeds ${MAX_BODY_BYTES} bytes`
+          : "router: passthrough upstream failed"
+      }));
     }
     return;
   }
@@ -2187,7 +2412,11 @@ const server = http.createServer(async (req, res) => {
   }
 
   // Deep-clone body so that any mutation never affects a retry.
-  body = JSON.parse(JSON.stringify(body));
+  // structuredClone (Node 17+) is ~3-5x faster than JSON.parse(JSON.stringify())
+  // on typical /v1/messages bodies and preserves Uint8Array / Map / Set
+  // (none used by Anthropic's schema today, but defensive). Fallback to
+  // JSON round-trip on the off chance a runtime lacks it.
+  body = deepClone(body);
 
   const key = sessionKey(body);
   const requestStart = Date.now(); // credit billing instant (peak vs off-peak)
@@ -2426,7 +2655,11 @@ const server = http.createServer(async (req, res) => {
           .filter((b) => b.type === "text")
           .map((b) => b.text)
           .join("\n");
-        const isFailure = FAILURE_PATTERNS.some((p) => p.test(textContent));
+        // Use isFailureResponse() instead of the bare pattern check so
+        // we can apply a length guard: a long text content with a
+        // failure phrase embedded is usually a real assistant reply
+        // that just happens to quote the failure, not a model breakage.
+        const isFailure = isFailureResponse(textContent);
 
         if (isFailure) {
           const escCount = sessionEscalations.get(key) || 0;
@@ -2437,7 +2670,7 @@ const server = http.createServer(async (req, res) => {
             sessionEscalations.set(key, escCount + 1);
             // Retry with higher tier
             const escBackend = resolveRoute(escalated);
-            const escBody = JSON.parse(JSON.stringify(body));
+            const escBody = deepClone(body);
             escBody.model = escBackend.model;
             try {
               const escUpstream = await callBackend(escBackend, escBody, { stream: false });
@@ -2465,7 +2698,7 @@ const server = http.createServer(async (req, res) => {
         console.warn(`[router] upstream HTTP ${upstream.status} -> auto-escalating ${decision.complexity} -> ${escalated}`);
         sessionEscalations.set(key, escCount + 1);
         const escBackend = resolveRoute(escalated);
-        const escBody = JSON.parse(JSON.stringify(body));
+        const escBody = deepClone(body);
         escBody.model = escBackend.model;
         try {
           const escUpstream = await callBackend(escBackend, escBody, { stream: false });
@@ -2499,9 +2732,14 @@ const server = http.createServer(async (req, res) => {
       res.end(await upstream.text());
     }
   } catch (e) {
+    // SECURITY (S2): the full error message can contain internal network
+    // topology (ECONNREFUSED 10.0.0.5:443), upstream HTML error pages,
+    // or path disclosures from the underlying fetch implementation.
+    // Log the verbose version server-side; send a generic message to
+    // the client so the proxy doesn't act as an info-leak oracle.
     console.error(`[router] upstream error: ${e.message}`);
     res.writeHead(502, { "content-type": "application/json" });
-    res.end(JSON.stringify({ error: `router: upstream call failed: ${e.message}` }));
+    res.end(JSON.stringify({ error: "router: upstream call failed" }));
   }
 });
 
@@ -2584,6 +2822,12 @@ server.listen(PORT, HOST, () => {
 
   if (ROUTER_TOKEN) console.log(`[router] proxyAuth=enabled`);
   else console.log(`[router] proxyAuth=disabled (set routerToken in config or ROUTER_TOKEN env to enable)`);
+
+  if (RATE_LIMIT_RPM > 0) {
+    console.log(`[router] rateLimit=${RATE_LIMIT_RPM}rpm burst=+${RATE_LIMIT_BURST} trustXff=${RATE_LIMIT_CFG?.trustXff === true}`);
+  } else {
+    console.log(`[router] rateLimit=disabled (set rateLimit.rpm in config to enable)`);
+  }
 
   if (routesTemplate) console.log(`[router] routesTemplate=ROUTES.md (keyword mode)`);
   else console.log(`[router] routesTemplate=built-in (JSON mode)`);

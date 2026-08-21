@@ -10,6 +10,8 @@
 
   "routerToken": null,
 
+  "rateLimit": null,
+
   "tools": {
     "minComplexity": "medium",
     "model": null
