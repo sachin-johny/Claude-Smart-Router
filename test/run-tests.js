@@ -2152,6 +2152,35 @@ async function runTests() {
     clearClassifierControls();
   });
 
+  await test("resilience: compact detection works with default-on knob (unset compactSkip)", async () => {
+    clearLog();
+    clearClassifierControls();
+    const cfg = buildConfig({
+      classifierModel: "classifier-flash",
+      // Intentionally: no classifierOpts, so compactSkip defaults to true
+    });
+    const p = path.join(LOG_DIR, "config-resilience-compact-default.json");
+    fs.writeFileSync(p, JSON.stringify(cfg));
+    await startRouter(p, { ROUTES_PATH: NO_ROUTES });
+
+    const compactText =
+      "CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\n\n" +
+      "- You already have all the context you need in the conversation above.\n";
+    const r = await post("/v1/messages", msgBody({
+      messages: [
+        { role: "user", content: "previous question" },
+        { role: "assistant", content: "previous answer" },
+        { role: "user", content: compactText },
+      ],
+      tools: TOOLS,
+    }));
+    eq(r.status, 200, "status 200");
+    eq(classifierCalls().length, 0, "zero classifier calls (default-on works)");
+    ok(r.text.includes("reply-from-tier-medium"), "routed to tier-medium", r.text);
+    await stopRouter();
+    clearClassifierControls();
+  });
+
   // ---------------- summary ----------------
   console.log(`\n=========================================`);
   console.log(`RESULT: ${passed} passed, ${failed} failed`);
