@@ -75,7 +75,10 @@
     "breakerCooldownMs": 60000,
     "singleFlight": true,
     "titleGenSkip": true,
-    "titleGenPattern": null
+    "titleGenPattern": null,
+    "compactSkip": true,
+    "compactPattern": null,
+    "compactHardMsgThreshold": 30
   },
 
   "routes": {

@@ -2008,6 +2008,111 @@ async function runTests() {
     clearClassifierControls();
   });
 
+  await test("resilience: compact prompt skips classifier, routes medium", async () => {
+    clearLog();
+    clearClassifierControls();
+    const cfg = buildConfig({
+      classifierModel: "classifier-flash",
+      classifierOpts: { compactSkip: true },
+    });
+    const p = path.join(LOG_DIR, "config-resilience-compact.json");
+    fs.writeFileSync(p, JSON.stringify(cfg));
+    await startRouter(p, { ROUTES_PATH: NO_ROUTES });
+
+    const compactText =
+      "CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\n\n" +
+      "- Do NOT use Read, Bash, Grep, Glob, Edit, Write, or ANY other tool.\n" +
+      "- You already have all the context you need in the conversation above.\n";
+    const r = await post("/v1/messages", msgBody({
+      messages: [
+        { role: "user", content: "previous question about something" },
+        { role: "assistant", content: "previous answer about something" },
+        { role: "user", content: compactText },
+      ],
+      tools: TOOLS,
+    }));
+    eq(r.status, 200, "status 200");
+    eq(classifierCalls().length, 0, "zero classifier calls (compact skipped)");
+    ok(r.text.includes("reply-from-tier-medium"), "routed to tier-medium", r.text);
+    await stopRouter();
+  });
+
+  await test("resilience: compact with large conversation routes hard", async () => {
+    clearLog();
+    clearClassifierControls();
+    const cfg = buildConfig({
+      classifierModel: "classifier-flash",
+      classifierOpts: { compactSkip: true, compactHardMsgThreshold: 30 },
+    });
+    const p = path.join(LOG_DIR, "config-resilience-compact-hard.json");
+    fs.writeFileSync(p, JSON.stringify(cfg));
+    await startRouter(p, { ROUTES_PATH: NO_ROUTES });
+
+    const compactText =
+      "CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\n\n" +
+      "- Do NOT use Read, Bash, Grep, Glob, Edit, Write, or ANY other tool.\n";
+    const messages = [];
+    for (let i = 0; i < 40; i++) {
+      messages.push({ role: "user", content: `message ${i}` });
+      messages.push({ role: "assistant", content: `reply ${i}` });
+    }
+    messages.push({ role: "user", content: compactText });
+    const r = await post("/v1/messages", msgBody({ messages, tools: TOOLS }));
+    eq(r.status, 200, "status 200");
+    eq(classifierCalls().length, 0, "zero classifier calls");
+    ok(r.text.includes("reply-from-tier-hard"), "routed to tier-hard (>30 messages)", r.text);
+    await stopRouter();
+  });
+
+  await test("resilience: compact negative gate — regular prompt still classifies", async () => {
+    clearLog();
+    clearClassifierControls();
+    const cfg = buildConfig({
+      classifierModel: "classifier-flash",
+      classifierOpts: { compactSkip: true },
+      heuristic: false,
+    });
+    const p = path.join(LOG_DIR, "config-resilience-compact-neg.json");
+    fs.writeFileSync(p, JSON.stringify(cfg));
+    await startRouter(p, { ROUTES_PATH: NO_ROUTES });
+    setReply(JSON.stringify({ complexity: "medium", clarity: "clear", assumptions: [] }));
+
+    const r = await post("/v1/messages", msgBody({
+      messages: [{ role: "user", content: "Please write me a simple hello world in Python" }],
+    }));
+    eq(r.status, 200, "status 200");
+    ok(classifierCalls().length >= 1, "classifier called for regular prompt", `got ${classifierCalls().length}`);
+    await stopRouter();
+  });
+
+  await test("resilience: compact detection can be disabled via config", async () => {
+    clearLog();
+    clearClassifierControls();
+    const cfg = buildConfig({
+      classifierModel: "classifier-flash",
+      classifierOpts: { compactSkip: false },
+      heuristic: false,
+    });
+    const p = path.join(LOG_DIR, "config-resilience-compact-disabled.json");
+    fs.writeFileSync(p, JSON.stringify(cfg));
+    await startRouter(p, { ROUTES_PATH: NO_ROUTES });
+    setReply(JSON.stringify({ complexity: "super_easy", clarity: "clear", assumptions: [] }));
+
+    const compactText =
+      "CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\n\n" +
+      "- Do NOT use Read, Bash, Grep, Glob, Edit, Write, or ANY other tool.\n";
+    const r = await post("/v1/messages", msgBody({
+      messages: [
+        { role: "user", content: "previous question" },
+        { role: "assistant", content: "previous answer" },
+        { role: "user", content: compactText },
+      ],
+    }));
+    eq(r.status, 200, "status 200");
+    ok(classifierCalls().length >= 1, "classifier called when compactSkip disabled", `got ${classifierCalls().length}`);
+    await stopRouter();
+  });
+
   await test("resilience: errors not cached — same prompt re-classified after recovery", async () => {
     clearLog();
     clearClassifierControls();

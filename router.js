@@ -1399,6 +1399,8 @@ const CLS_BREAKER_THRESHOLD   = CLS_CFG.breakerThreshold ?? 3;        // 0 disab
 const CLS_BREAKER_COOLDOWN_MS = CLS_CFG.breakerCooldownMs ?? 60_000;
 const CLS_SINGLE_FLIGHT     = CLS_CFG.singleFlight !== false;         // default true
 const CLS_TITLEGEN_SKIP     = CLS_CFG.titleGenSkip !== false;         // default true
+const CLS_COMPACT_SKIP      = CLS_CFG.compactSkip !== false;          // default true
+const CLS_COMPACT_HARD_MSG_THRESHOLD = CLS_CFG.compactHardMsgThreshold ?? 30;
 
 // Title-gen detection. Claude Code wraps the session text in
 // <session>…</session> and appends a "Write the title in the
@@ -1417,6 +1419,28 @@ if (typeof CLS_CFG.titleGenPattern === "string") {
   } catch (e) {
     console.warn(`[router] classifier.titleGenPattern invalid, using default: ${e.message}`);
     CLS_TITLEGEN_RE = CLS_TITLEGEN_RE_DEFAULT;
+  }
+}
+
+// /compact summarization detection. Claude Code's /compact command
+// asks the model to summarize the conversation but wraps the request
+// in anti-tool-call instructions ("CRITICAL: Respond with TEXT ONLY.
+// Do NOT call any tools"). The classifier sees the simple-looking
+// instructions and may mis-route to super_easy, causing the cheap
+// model (glm-4.7) to produce a poor summary — the user perceives
+// /compact as "failed" and retries (where the classifier may then
+// return medium and /compact "works"). Same prompt → non-deterministic
+// routing → flaky /compact. Force-route to medium (or hard for large
+// conversations) so summarization always goes to a capable model.
+// Disable via classifier.compactSkip: false.
+const CLS_COMPACT_RE_DEFAULT = /CRITICAL:\s*Respond with TEXT ONLY\b/i;
+let CLS_COMPACT_RE = CLS_COMPACT_RE_DEFAULT;
+if (typeof CLS_CFG.compactPattern === "string") {
+  try {
+    CLS_COMPACT_RE = new RegExp(CLS_CFG.compactPattern, "i");
+  } catch (e) {
+    console.warn(`[router] classifier.compactPattern invalid, using default: ${e.message}`);
+    CLS_COMPACT_RE = CLS_COMPACT_RE_DEFAULT;
   }
 }
 
@@ -1533,6 +1557,7 @@ const classifyStats = {
   singleFlightHits: 0,
   breakerSkips: 0,
   titleGenSkipped: 0,
+  compactSkipped: 0,
   fallbackSession: 0,
   fallbackHeuristic: 0,
   fallbackMedium: 0,
@@ -2472,6 +2497,7 @@ const server = http.createServer(async (req, res) => {
         classifySingleFlightHits: classifyStats.singleFlightHits,
         classifyBreakerSkips: classifyStats.breakerSkips,
         classifyTitleGenSkips: classifyStats.titleGenSkipped,
+        classifyCompactSkips: classifyStats.compactSkipped,
         classifyFallbackSession: classifyStats.fallbackSession,
         classifyFallbackHeuristic: classifyStats.fallbackHeuristic,
         classifyFallbackMedium: classifyStats.fallbackMedium,
@@ -2718,10 +2744,26 @@ const server = http.createServer(async (req, res) => {
       !hasTools &&
       (body.messages || []).length === 1 &&
       CLS_TITLEGEN_RE.test(text);
+    // /compact detection — see CLS_COMPACT_RE_DEFAULT comment above.
+    // No tools/messages.length gate: the regex is specific enough (the
+    // "CRITICAL: Respond with TEXT ONLY" prefix is a CC protocol artifact,
+    // not user-typed prose). Adversarial exposure matches the greetings
+    // heuristic; disable via classifier.compactSkip: false.
+    const isCompact = CLS_COMPACT_SKIP &&
+      CLS_COMPACT_RE.test(text);
     if (isTitleGen) {
       t = { complexity: "super_easy", clarity: "clear", assumptions: [], source: "titlegen" };
       classifyStats.titleGenSkipped++;
       debugLog(`title-gen request detected -> super_easy (no classifier call)`);
+    } else if (isCompact) {
+      // Force-route to medium (or hard for large conversations). The
+      // prompt is structurally predictable — calling the classifier
+      // just wastes a call and risks a non-deterministic mis-route.
+      const msgCount = (body.messages || []).length;
+      const compactComplexity = msgCount > CLS_COMPACT_HARD_MSG_THRESHOLD ? "hard" : "medium";
+      t = { complexity: compactComplexity, clarity: "clear", assumptions: [], source: "compact" };
+      classifyStats.compactSkipped++;
+      debugLog(`compact request detected -> ${compactComplexity} (msgCount=${msgCount}, no classifier call)`);
     } else {
       // Try heuristic pre-filter first (saves a classifier call for obvious cases)
       const heuristic = HEURISTIC_ENABLED ? heuristicClassify(text, contextSummary) : null;
@@ -3037,7 +3079,8 @@ server.listen(PORT, HOST, () => {
     `[router] classifier: retries=${CLS_MAX_RETRIES} timeoutMs=${CLS_TIMEOUT_MS} ` +
     `deadlineMs=${CLS_DEADLINE_MS} backoff=${CLS_BACKOFF_BASE_MS}-${CLS_BACKOFF_MAX_MS}ms ` +
     `jitter=±${Math.round(CLS_BACKOFF_JITTER * 100)}% singleFlight=${CLS_SINGLE_FLIGHT ? "on" : "off"} ` +
-    `titleGenSkip=${CLS_TITLEGEN_SKIP ? "on" : "off"}`
+    `titleGenSkip=${CLS_TITLEGEN_SKIP ? "on" : "off"} compactSkip=${CLS_COMPACT_SKIP ? "on" : "off"}` +
+    (CLS_COMPACT_SKIP ? ` (compactHardMsgThreshold=${CLS_COMPACT_HARD_MSG_THRESHOLD})` : "")
   );
   console.log(
     `[router] classifier: breaker=${CLS_BREAKER_THRESHOLD > 0 ? `threshold=${CLS_BREAKER_THRESHOLD} cooldown=${CLS_BREAKER_COOLDOWN_MS}ms` : "disabled"}`
