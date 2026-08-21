@@ -1279,6 +1279,36 @@ function isOAuthToken(apiKey) {
   return apiKey && apiKey.includes("sk-ant-oat");
 }
 
+// Human gloss for upstream HTTP statuses, appended to error and debug
+// logs. "classifier HTTP 529" at 2am tells the operator nothing; the
+// hint says whether to wait it out (overloaded), fix a key (auth
+// failed), or change config (not found).
+function httpStatusHint(status) {
+  const hints = {
+    400: "bad request",
+    401: "auth failed — key invalid, expired, or wrong provider",
+    403: "forbidden — key lacks access to this model",
+    404: "not found — wrong baseUrl or model name",
+    408: "request timeout",
+    413: "payload too large",
+    422: "unprocessable — malformed body or bad params",
+    429: "rate limited — quota or RPM exceeded",
+    500: "upstream server error",
+    502: "bad gateway",
+    503: "upstream unavailable",
+    504: "upstream timeout",
+    529: "overloaded — upstream at capacity",
+  };
+  return hints[status] || (status >= 500 ? "upstream error" : "");
+}
+
+// "529 (overloaded — upstream at capacity)" for logs; the bare status
+// when there is nothing useful to add (200s, odd 3xx, ...).
+function fmtHttpStatus(status) {
+  const hint = httpStatusHint(status);
+  return hint ? `${status} (${hint})` : String(status);
+}
+
 // Resolve the complexity level, applying tool-aware bumping.
 function applyToolFloor(complexity) {
   if (!TOOLS_MIN_COMPLEXITY) return complexity;
@@ -1330,7 +1360,7 @@ async function callBackend(backend, body, { stream, timeoutMs } = {}) {
       body: JSON.stringify(body),
       signal: controller.signal,
     });
-    debugLog(`upstream <- HTTP ${res.status} from ${backend.model}`);
+    debugLog(`upstream <- HTTP ${fmtHttpStatus(res.status)} from ${backend.model}`);
     return res;
   } finally {
     clearTimeout(timer);
@@ -1651,7 +1681,7 @@ async function callClassifier(payload) {
         body: JSON.stringify(ollamaPayload),
         signal: controller.signal,
       });
-      if (!res.ok) throw new Error(`ollama HTTP ${res.status}`);
+      if (!res.ok) throw new Error(`ollama HTTP ${fmtHttpStatus(res.status)}`);
       const data = await res.json();
       return data.response || "";
     } finally {
@@ -1706,17 +1736,17 @@ async function callClassifier(payload) {
           const delay = computeRetryDelayMs(attempt, retryAfterMs);
           const wouldFinishAt = Date.now() + delay;
           if (wouldFinishAt >= deadlineEnd) {
-            throw new Error(`classifier HTTP ${res.status} (retry would exceed deadline)`);
+            throw new Error(`classifier HTTP ${fmtHttpStatus(res.status)} (retry would exceed deadline)`);
           }
           debugLog(
-            `classifier HTTP ${res.status}, retry ${attempt + 1}/${CLS_MAX_RETRIES} in ${Math.round(delay)}ms` +
+            `classifier HTTP ${fmtHttpStatus(res.status)}, retry ${attempt + 1}/${CLS_MAX_RETRIES} in ${Math.round(delay)}ms` +
             (retryAfterMs ? ` (retry-after=${Math.round(retryAfterMs)}ms)` : "")
           );
           clearTimeout(timer);
           await new Promise((r) => setTimeout(r, delay));
           continue;
         }
-        throw new Error(`classifier HTTP ${res.status}`);
+        throw new Error(`classifier HTTP ${fmtHttpStatus(res.status)}`);
       }
       const data = await res.json();
       return (data.content || [])

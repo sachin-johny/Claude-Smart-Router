@@ -72,6 +72,9 @@ function eq(actual, expected, label) {
 
 let routerProc = null;
 let mockProc = null;
+// Rolling tail of the router's stderr so tests can assert on warn text
+// (e.g. human-readable status hints) without parsing forwarded output.
+let stderrTail = "";
 
 function waitReady(proc, name, timeoutMs) {
   return new Promise((resolve, reject) => {
@@ -124,7 +127,10 @@ async function startRouter(configFile, env = {}) {
     stdio: ["ignore", "pipe", "pipe"],
   });
   routerProc.stdout.on("data", () => {});
-  routerProc.stderr.on("data", (d) => process.stderr.write(`[router] ${d}`));
+  routerProc.stderr.on("data", (d) => {
+    process.stderr.write(`[router] ${d}`);
+    stderrTail = (stderrTail + d.toString()).slice(-131072);
+  });
   return waitReady(routerProc, "router", 10_000);
 }
 
@@ -184,6 +190,14 @@ function readLog() {
 
 function clearLog() {
   fs.rmSync(path.join(LOG_DIR, "requests.jsonl"), { force: true });
+}
+
+function clearRouterStderr() {
+  stderrTail = "";
+}
+
+function routerStderr() {
+  return stderrTail;
 }
 
 // Control the mock backend's behavior (files it re-reads per request)
@@ -1971,6 +1985,50 @@ async function runTests() {
 
     const health = await (await fetch(`http://localhost:${ROUTER_PORT}/health`)).json();
     eq(health.classifyBreaker.state, "closed", "breaker state closed after probe success");
+    await stopRouter();
+    clearClassifierControls();
+  });
+
+  await test("resilience: triage-failure logs carry human-readable status hints", async () => {
+    clearLog();
+    clearClassifierControls();
+    const cfg = buildConfig({
+      classifierModel: "classifier-flash",
+      classifierOpts: {
+        backoffBaseMs: 10, timeoutMs: 500, deadlineMs: 2000,
+        breakerThreshold: 99, breakerCooldownMs: 60_000,
+      },
+    });
+    const p = path.join(LOG_DIR, "config-status-hint.json");
+    fs.writeFileSync(p, JSON.stringify(cfg));
+    await startRouter(p, { ROUTES_PATH: NO_ROUTES });
+
+    // 529 is retryable: all 3 attempts fail, the final throw carries the hint.
+    setClassifierFail(99, { status: 529 });
+    clearRouterStderr();
+    const r1 = await post("/v1/messages", msgBody({
+      messages: [{ role: "user", content: "status hint five two nine unique" }],
+    }));
+    eq(r1.status, 200, "529 case: request still succeeds via fallback");
+    ok(
+      routerStderr().includes("classifier HTTP 529 (overloaded"),
+      "529 fallback warn says 'overloaded'",
+      routerStderr()
+    );
+
+    // 401 is not retryable: immediate throw, hint names the actual problem.
+    setClassifierFail(99, { status: 401 });
+    clearRouterStderr();
+    const r2 = await post("/v1/messages", msgBody({
+      messages: [{ role: "user", content: "status hint four oh one unique" }],
+    }));
+    eq(r2.status, 200, "401 case: request still succeeds via fallback");
+    ok(
+      routerStderr().includes("classifier HTTP 401 (auth failed"),
+      "401 fallback warn says 'auth failed'",
+      routerStderr()
+    );
+
     await stopRouter();
     clearClassifierControls();
   });
