@@ -33,7 +33,9 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 const readline = require("readline");
+const util = require("util");
 const { Readable } = require("stream");
+const { spawn } = require("child_process");
 
 // ---------------------------------------------------------------
 // Key management: `claude-smart-router key set|list|remove`
@@ -84,6 +86,34 @@ function maskKey(k) {
   if (!k) return "(not set)";
   if (k.length <= 8) return k[0] + "***";
   return `${k.slice(0, 4)}...${k.slice(-4)}`;
+}
+
+// Read-only masked view of the keystore for GET /keys. NEVER returns
+// plaintext — even when gated by routerToken, defense-in-depth: a leaked
+// dashboard token still can't exfiltrate raw API keys.
+function maskedKeystore() {
+  const keys = readKeystore();
+  const out = {};
+  for (const name of KEY_NAMES) out[name] = maskKey(keys[name]);
+  return out;
+}
+
+// Platform-aware browser launch. Silently no-ops on headless boxes
+// (no $DISPLAY and no $WAYLAND_DISPLAY on Linux, CI, SSH sessions) so
+// openDashboardOnStart=true never breaks startup. Detached + unref'd so
+// the browser survives the router and doesn't keep it alive on shutdown.
+function openBrowser(url) {
+  const isMac = process.platform === "darwin";
+  const isWin = process.platform === "win32";
+  const isLinux = process.platform === "linux";
+  if (isLinux && !process.env.DISPLAY && !process.env.WAYLAND_DISPLAY) return;
+  let cmd, args;
+  if (isMac) { cmd = "open"; args = [url]; }
+  else if (isWin) { cmd = "cmd"; args = ["/c", "start", "", url]; }
+  else if (isLinux) { cmd = "xdg-open"; args = [url]; }
+  else return;
+  try { spawn(cmd, args, { detached: true, stdio: "ignore" }).unref(); }
+  catch (_) { /* best-effort; browser launch is not critical */ }
 }
 
 function cmdKey(args) {
@@ -352,41 +382,87 @@ const DEBUG =
   config.debug === true ||
   ["1", "true", "yes"].includes((process.env.DEBUG || "").toLowerCase());
 
+// Dashboard debug: capture the per-request trace in the /logs ring (and
+// so the dashboard's Router log card) WITHOUT printing it to the
+// terminal. Separate from "debug" on purpose — debug:true prints AND
+// mirrors; dashboard.debug only mirrors, so the terminal stays quiet
+// while the dashboard keeps its verbose trace.
+const DASHBOARD_DEBUG =
+  config.dashboard?.debug === true ||
+  ["1", "true", "yes"].includes((process.env.DASHBOARD_DEBUG || "").toLowerCase());
+
+// SECURITY (S7): redaction applied to EVERYTHING the router prints —
+// stdout today, and the /logs dashboard tail captured below. Debug-mode
+// prompt previews and upstream snippets can contain pasted API keys,
+// passwords, or PII ("here, store this token: sk-ant-..."). The patterns
+// are conservative — they match the common vendor prefixes (Anthropic
+// sk-ant-, OpenAI sk-, GitHub ghp_, AWS AKIA, plus generic password=...
+// assignments). False positives (a code snippet that legitimately contains
+// "sk-") are acceptable — the user would prefer an over-redacted log over
+// a leaked key in journald or the dashboard.
+const SECRET_PATTERNS = [
+  /\bsk-ant-[A-Za-z0-9_-]{10,}/g,            // Anthropic
+  /\bsk-[A-Za-z0-9_-]{20,}(?![A-Za-z0-9_-])/g, // OpenAI (length-gated to avoid matching sk-ant-)
+  /\bghp_[A-Za-z0-9]{20,}/g,                  // GitHub PAT
+  /\bgho_[A-Za-z0-9]{20,}/g,                  // GitHub OAuth
+  /\bAKIA[0-9A-Z]{16}/g,                      // AWS access key id
+  /\bpassword\s*[:=]\s*\S+/gi,                // password=foo
+  /\bapi[_-]?key\s*[:=]\s*\S+/gi,             // api_key=foo
+  /\btoken\s*[:=]\s*\S+/gi,                   // token=foo
+  /\bsecret\s*[:=]\s*\S+/gi,                  // secret=foo
+  /\bbearer\s+[A-Za-z0-9._-]{10,}/gi,        // Bearer <jwt-ish>
+];
+function redactForLog(v) {
+  if (typeof v !== "string") return v;
+  let s = v;
+  for (const re of SECRET_PATTERNS) s = s.replace(re, "[REDACTED]");
+  return s;
+}
 function debugLog(...args) {
-  if (!DEBUG) return;
-  // SECURITY (S7): user prompts and upstream reply snippets logged below
-  // can contain pasted API keys, passwords, or PII ("here, store this
-  // token: sk-ant-..."). Redact obvious secret-looking substrings before
-  // they hit stdout/logs/journald. The patterns are conservative — they
-  // match the common vendor prefixes (Anthropic sk-ant-, OpenAI sk-,
-  // GitHub ghp_, AWS AKIA, plus generic password=... assignments).
-  // False positives (a code snippet that legitimately contains "sk-")
-  // are acceptable — debug logging is opt-in via DEBUG=1 and the user
-  // would prefer an over-redacted log over a leaked key in journald.
-  const SECRET_PATTERNS = [
-    /\bsk-ant-[A-Za-z0-9_-]{10,}/g,            // Anthropic
-    /\bsk-[A-Za-z0-9_-]{20,}(?![A-Za-z0-9_-])/g, // OpenAI (length-gated to avoid matching sk-ant-)
-    /\bghp_[A-Za-z0-9]{20,}/g,                  // GitHub PAT
-    /\bgho_[A-Za-z0-9]{20,}/g,                  // GitHub OAuth
-    /\bAKIA[0-9A-Z]{16}/g,                      // AWS access key id
-    /\bpassword\s*[:=]\s*\S+/gi,                // password=foo
-    /\bapi[_-]?key\s*[:=]\s*\S+/gi,             // api_key=foo
-    /\btoken\s*[:=]\s*\S+/gi,                   // token=foo
-    /\bsecret\s*[:=]\s*\S+/gi,                  // secret=foo
-    /\bbearer\s+[A-Za-z0-9._-]{10,}/gi,        // Bearer <jwt-ish>
-  ];
-  const redact = (v) => {
-    if (typeof v !== "string") return v;
-    let s = v;
-    for (const re of SECRET_PATTERNS) s = s.replace(re, "[REDACTED]");
-    return s;
+  const safe = args.map(redactForLog);
+  if (DEBUG) console.log("[router:debug]", ...safe);
+  // Dashboard-only mode: straight into the ring, stdout untouched.
+  else if (DASHBOARD_DEBUG) captureConsoleLine("log", ["[router:debug]", ...safe]);
+  // neither flag set — skip the trace entirely
+}
+
+// ---- /logs ring buffer --------------------------------------------
+// Everything the router prints to the terminal is mirrored here (after
+// the same redaction) and tailed by the dashboard's "Router log" card —
+// the UI shows exactly what the terminal shows. The console methods are
+// wrapped right here so the boot summary (listening URL, routes, modes)
+// lands in the ring too.
+const LOG_RING_MAX = 400;  // lines kept for the tail
+const LOG_LINE_MAX = 2000; // per-line cap — one huge debug blob can't balloon memory
+const logRing = [];
+let logSeq = 0; // monotonic cursor; /logs clients pass ?after=<seq> to append
+function captureConsoleLine(level, args) {
+  try {
+    // util.format matches console.log's own rendering (format strings,
+    // object inspection), so the captured line reads like the terminal's.
+    let text = util.format(...args.map(redactForLog));
+    if (text.length > LOG_LINE_MAX) text = text.slice(0, LOG_LINE_MAX) + " …[truncated]";
+    logRing.push({ i: ++logSeq, t: Date.now(), level, text });
+    if (logRing.length > LOG_RING_MAX) logRing.splice(0, logRing.length - LOG_RING_MAX);
+  } catch (_) { /* mirroring must never break the log call itself */ }
+}
+for (const level of ["log", "warn", "error"]) {
+  const orig = console[level].bind(console);
+  console[level] = (...args) => {
+    captureConsoleLine(level, args);
+    orig(...args);
   };
-  console.log("[router:debug]", ...args.map(redact));
 }
 
 // Optional proxy auth: if routerToken is set in config, all requests
 // must include Authorization: Bearer <token> matching it.
 const ROUTER_TOKEN = process.env.ROUTER_TOKEN || config.routerToken || null;
+
+// Dashboard auto-open: when true, the router calls openBrowser() once
+// the server is listening. Off by default — auto-opening a browser from
+// a CLI breaks on headless boxes, SSH, WSL without a browser, CI, etc.
+// Default behavior just prints the URL for cmd-click.
+const OPEN_DASHBOARD_ON_START = config.openDashboardOnStart === true;
 
 // ---------------------------------------------------------------
 // 5-tier complexity levels (from alexrudloff/llmrouter)
@@ -713,22 +789,39 @@ function isPeakNow(now = Date.now()) {
   peakCache = { at: now, val: peakState(now) };
   return peakCache.val;
 }
-// Minutes until the peak/off-peak state flips — for hints and /credits.
-function minutesUntilPeakChange(now = Date.now()) {
+
+// SGT wall clock -> epoch ms (h minus 8 may go negative; Date.UTC
+// normalizes). Keep in sync with peakState's 14:00-18:00 window.
+const PEAK_START_SGT_H = 14;
+const PEAK_LEN_MS = 4 * 60 * 60 * 1000;
+function sgtWallMs(y, mo, d, h) {
+  return Date.UTC(y, mo, d, h - 8, 0, 0, 0);
+}
+
+// The peak window that either contains now or starts next, as absolute
+// instants. The dashboard renders these in the VIEWER's timezone (a
+// +02:00 user sees peak as 08:00-12:00 local), so the server ships
+// instants — never wall-clock strings.
+function peakWindow(now = Date.now()) {
   const sgt = new Date(now + SGT_OFFSET_MS);
-  const mins = sgt.getUTCHours() * 60 + sgt.getUTCMinutes();
-  const isWeekday = (d) => d >= 1 && d <= 5;
-  if (isWeekday(sgt.getUTCDay()) && mins >= 14 * 60 && mins < 18 * 60) {
-    return 18 * 60 - mins; // in peak: ends at 18:00 SGT
+  const y = sgt.getUTCFullYear(), mo = sgt.getUTCMonth(), d = sgt.getUTCDate();
+  if (peakState(now)) {
+    return { inPeak: true, startMs: sgtWallMs(y, mo, d, PEAK_START_SGT_H), endMs: sgtWallMs(y, mo, d, PEAK_START_SGT_H + 4) };
   }
   // Off-peak/weekend: scan forward for the next weekday 14:00 SGT
   for (let add = 0; add <= 7; add++) {
-    const d = new Date(Date.UTC(sgt.getUTCFullYear(), sgt.getUTCMonth(), sgt.getUTCDate() + add));
-    if (!isWeekday(d.getUTCDay())) continue;
-    const targetMins = add * 24 * 60 + 14 * 60;
-    if (targetMins > mins) return targetMins - mins;
+    const day = new Date(Date.UTC(y, mo, d + add)).getUTCDay();
+    if (day < 1 || day > 5) continue;
+    const startMs = sgtWallMs(y, mo, d + add, PEAK_START_SGT_H);
+    if (startMs > now) return { inPeak: false, startMs, endMs: startMs + PEAK_LEN_MS };
   }
-  return 0;
+  return { inPeak: false, startMs: now, endMs: now }; // unreachable: a weekday always falls within 7 days
+}
+
+// Minutes until the peak/off-peak state flips — for hints and /credits.
+function minutesUntilPeakChange(now = Date.now()) {
+  const w = peakWindow(now);
+  return Math.round(((w.inPeak ? w.endMs : w.startMs) - now) / 60000);
 }
 
 // Weekly cycle: anchor = a known past reset time (ISO string). Without
@@ -776,14 +869,30 @@ function creditsUsedSince(cutoff) {
 function creditsSnapshot(now = Date.now()) {
   const cap5h = CREDIT_CAPS.fiveHour || 0;
   const capWk = CREDIT_CAPS.weekly || 0;
-  const used5h = creditsUsedSince(now - 5 * 60 * 60 * 1000);
+  const win5hStart = now - 5 * 60 * 60 * 1000;
+  const used5h = creditsUsedSince(win5hStart);
   const usedWk = creditsUsedSince(weeklyCycleStart(now));
+  // Oldest spend still inside the 5h window: the instant the window
+  // fully replenishes (assuming no new spend). Null when already empty.
+  let oldest5h = null;
+  for (const e of creditEvents) {
+    if (e.t >= win5hStart && e.t <= now && (oldest5h === null || e.t < oldest5h)) oldest5h = e.t;
+  }
+  const clearsMs = oldest5h === null ? null : oldest5h + 5 * 60 * 60 * 1000;
+  // Peak instants are epoch-based so the dashboard can render them in
+  // the viewer's own timezone (the server's tz may differ).
+  const win = peakWindow(now);
+  const changeMs = win.inPeak ? win.endMs : win.startMs;
   return {
     enabled: CREDITS_ENABLED,
+    warnPct: CREDITS_WARN_PCT,
     fiveHour: {
       used: +used5h.toFixed(2),
       cap: cap5h,
       pct: cap5h ? Math.round((used5h / cap5h) * 100) : 0,
+      ...(clearsMs !== null
+        ? { clearsAt: new Date(clearsMs).toISOString(), clearsInMin: Math.round((clearsMs - now) / 60000) }
+        : { clearsAt: null, clearsInMin: null }),
     },
     weekly: {
       used: +usedWk.toFixed(2),
@@ -799,8 +908,11 @@ function creditsSnapshot(now = Date.now()) {
         : { resetsAt: null, resetsInMin: null, window: "rolling-7d" }),
     },
     peak: {
-      now: isPeakNow(now),
-      changeInMin: Math.round(minutesUntilPeakChange(now)),
+      now: win.inPeak,
+      changeInMin: Math.round((changeMs - now) / 60000),
+      changeAt: new Date(changeMs).toISOString(),
+      windowStartAt: new Date(win.startMs).toISOString(),
+      windowEndAt: new Date(win.endMs).toISOString(),
     },
     events: creditEvents.length,
   };
@@ -894,8 +1006,11 @@ function maybeInjectCreditHints(key, lastUserIdx, firstUserIdx, messages) {
       ` — pace remaining usage accordingly.]`;
     done.add("weekly");
   } else if (!done.has("peak") && CREDITS_PEAK_HINT && snap.peak.now) {
+    // Local wall-clock translation of the SGT window — the router host's
+    // tz is usually the user's, so this answers "when is peak for me?".
+    const hm = (iso) => new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
     hint =
-      `[router: peak hours (Mon-Fri 14:00-18:00 UTC+8) — GLM credits bill at ` +
+      `[router: peak hours (Mon-Fri 14:00-18:00 UTC+8 = ${hm(snap.peak.windowStartAt)}-${hm(snap.peak.windowEndAt)} on this machine) — GLM credits bill at ` +
       `full rate for the next ~${snap.peak.changeInMin} min; outside peak they cost half.]`;
     done.add("peak");
   }
@@ -2468,6 +2583,457 @@ function resolveRoute(complexity) {
 // Server
 // ---------------------------------------------------------------
 
+// Self-contained read-only dashboard. Vanilla JS polls /health + /credits
+// every 5s and /keys every 15s. Zero external resources, zero build step,
+// loopback-only by default (gated by checkAuth + checkRateLimit like every
+// other route). No new files in the published package — the HTML lives here
+// so the single-file identity of router.js is preserved.
+const DASHBOARD_HTML = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>claude-smart-router</title>
+<style>
+  /* Palette: reference data-viz tokens. Chrome inks per surface; status
+     colors (good/warn/crit) are reserved for STATE and always ship with
+     a dot + text label, never color alone; the meter fill runs
+     accent -> warn -> crit by severity with a same-hue tinted track.
+     Light is default; dark re-tokens under both the OS media query and
+     the data-theme toggle (the :not guard makes the toggle win both
+     ways). */
+  :root {
+    color-scheme: light;
+    --page: #f9f9f7; --surface: #fcfcfb;
+    --ink: #0b0b0b; --ink-2: #52514e; --muted: #898781;
+    --grid: #e1e0d9; --baseline: #c3c2b7; --border: rgba(11,11,11,0.10);
+    --accent: #2a78d6; --good: #0ca30c; --warn: #fab219; --crit: #d03b3b;
+    --wash-good: rgba(12,163,12,0.10); --wash-warn: rgba(250,178,25,0.14);
+    --wash-warn-strong: rgba(250,178,25,0.28); --wash-crit: rgba(208,59,59,0.10);
+    --wash-muted: rgba(137,135,129,0.14);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:where(:not([data-theme="light"])) {
+      color-scheme: dark;
+      --page: #0d0d0d; --surface: #1a1a19;
+      --ink: #ffffff; --ink-2: #c3c2b7; --muted: #898781;
+      --grid: #2c2c2a; --baseline: #383835; --border: rgba(255,255,255,0.10);
+      --accent: #3987e5; --good: #0ca30c; --warn: #fab219; --crit: #d03b3b;
+      --wash-good: rgba(12,163,12,0.16); --wash-warn: rgba(250,178,25,0.16);
+      --wash-warn-strong: rgba(250,178,25,0.32); --wash-crit: rgba(208,59,59,0.16);
+      --wash-muted: rgba(137,135,129,0.20);
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --page: #0d0d0d; --surface: #1a1a19;
+    --ink: #ffffff; --ink-2: #c3c2b7; --muted: #898781;
+    --grid: #2c2c2a; --baseline: #383835; --border: rgba(255,255,255,0.10);
+    --accent: #3987e5; --good: #0ca30c; --warn: #fab219; --crit: #d03b3b;
+    --wash-good: rgba(12,163,12,0.16); --wash-warn: rgba(250,178,25,0.16);
+    --wash-warn-strong: rgba(250,178,25,0.32); --wash-crit: rgba(208,59,59,0.16);
+    --wash-muted: rgba(137,135,129,0.20);
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 0 20px 48px; background: var(--page); color: var(--ink);
+    font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  .wrap { max-width: 1020px; margin: 0 auto; }
+  header { display: flex; align-items: center; justify-content: space-between;
+    gap: 16px; padding: 26px 0 6px; flex-wrap: wrap; }
+  .brand { display: flex; align-items: center; gap: 12px; }
+  h1 { font-size: 17px; margin: 0; font-weight: 650; letter-spacing: -0.01em; }
+  .hright { display: flex; align-items: center; gap: 12px; }
+  .clock { font-size: 12px; color: var(--ink-2); white-space: nowrap; }
+  .theme-btn { border: 1px solid var(--border); background: var(--surface); color: var(--ink-2);
+    width: 30px; height: 30px; border-radius: 8px; cursor: pointer; font-size: 14px;
+    line-height: 1; padding: 0; }
+  .theme-btn:hover { color: var(--ink); }
+  .sub { color: var(--muted); font-size: 12px; margin: 0 0 18px; }
+  main { display: grid; grid-template-columns: repeat(6, 1fr); gap: 14px; }
+  .card { background: var(--surface); border: 1px solid var(--border);
+    border-radius: 12px; padding: 18px 20px; }
+  .c-credits { grid-column: span 4; padding: 14px 20px; display: flex; flex-direction: column; }
+  .c-health { grid-column: span 2; }
+  .c-log { grid-column: span 6; }
+  .c-keys { grid-column: span 3; }
+  .c-repo { grid-column: span 3; }
+  h2 { margin: 0 0 14px; font-size: 12px; color: var(--muted);
+    text-transform: uppercase; letter-spacing: 0.6px; font-weight: 600;
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .c-credits h2 { margin-bottom: 8px; }
+  .h2sub { text-transform: none; letter-spacing: 0; font-size: 12px;
+    font-weight: 500; display: flex; align-items: center; gap: 8px; }
+  .mdetail b, .peak-cap b { color: var(--ink-2); font-weight: 600; }
+  /* credit meters */
+  .meters { display: grid; grid-template-columns: 1fr 1fr; gap: 18px 26px; }
+  .mhead { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+  .mlabel { font-size: 12px; color: var(--ink-2); font-weight: 600; }
+  .mused { font-size: 12px; color: var(--muted); }
+  .pct { font-size: 30px; font-weight: 650; letter-spacing: -0.01em; margin: 6px 0 8px; }
+  .c-credits .pct { font-size: 22px; margin: 4px 0 6px; }
+  .track { position: relative; height: 10px; border-radius: 5px; background: var(--grid); }
+  .fill { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 0 5px 5px 0;
+    transition: width 0.4s, background 0.4s; }
+  .wtick { position: absolute; top: -3px; bottom: -3px; width: 1px; background: var(--baseline); }
+  .mdetail { margin-top: 9px; font-size: 12px; color: var(--muted); }
+  .c-credits .mdetail { margin-top: 6px; }
+  /* peak status caption */
+  .peak-cap { margin-top: 12px; font-size: 12px; color: var(--muted); }
+  /* peak hours, nested inside the credits card, filling the space below the meters */
+  .peak-inline { margin-top: auto; padding-top: 16px; border-top: 1px solid var(--grid); }
+  .peak-inline h2 { margin-bottom: 8px; }
+  .peak-inline .peak-cap { margin-top: 10px; }
+  /* router log tail: the terminal's own output, scrollable */
+  #logbox { margin-top: 6px; height: 318px; overflow-y: auto;
+    border: 1px solid var(--grid); border-radius: 8px; padding: 8px 10px;
+    background: var(--wash-muted);
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 11px; line-height: 1.6; }
+  .ll { white-space: pre-wrap; overflow-wrap: anywhere; color: var(--ink-2); }
+  .ll .lt { color: var(--muted); margin-right: 6px; }
+  .ll.warn { color: var(--ink); }
+  .ll.error { color: var(--crit); }
+  .log-empty { color: var(--muted); }
+  /* status pills: dot carries the hue, text stays in ink */
+  .pill { display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px;
+    border-radius: 999px; font-size: 11px; font-weight: 600; letter-spacing: 0.4px;
+    text-transform: uppercase; color: var(--ink-2); }
+  .pill .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+  .pill.good { background: var(--wash-good); } .pill.good .dot { background: var(--good); }
+  .pill.warn { background: var(--wash-warn); } .pill.warn .dot { background: var(--warn); }
+  .pill.crit { background: var(--wash-crit); } .pill.crit .dot { background: var(--crit); }
+  .pill.muted { background: var(--wash-muted); } .pill.muted .dot { background: var(--muted); }
+  .stat { display: flex; justify-content: space-between; gap: 12px; padding: 5px 0;
+    font-size: 13px; border-bottom: 1px solid var(--grid); }
+  .stat:last-child { border-bottom: none; }
+  .stat .k { color: var(--ink-2); }
+  .stat .v { font-weight: 600; }
+  .key { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 12px; }
+  .err { color: var(--crit); font-size: 12px; }
+  footer { margin-top: 18px; font-size: 11px; color: var(--muted); }
+  @media (max-width: 880px) {
+    .c-credits, .c-health, .c-log, .c-keys, .c-repo { grid-column: span 6; }
+  }
+  @media (max-width: 640px) { .meters { grid-template-columns: 1fr; } }
+  @media (prefers-reduced-motion: reduce) { .fill { transition: none; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="brand">
+      <h1>claude-smart-router</h1>
+      <span id="status">—</span>
+    </div>
+    <div class="hright">
+      <span class="clock" id="clock">—</span>
+      <button class="theme-btn" id="theme-btn" aria-label="Toggle light/dark theme" title="Toggle light/dark theme">◐</button>
+    </div>
+  </header>
+  <div class="sub" id="meta">connecting…</div>
+  <main>
+    <section class="card c-credits">
+      <h2>GLM Coding Plan credits</h2>
+      <div class="meters">
+        <div class="meter">
+          <div class="mhead">
+            <span class="mlabel">5-hour window</span>
+            <span class="mused" id="used-5h">—</span>
+          </div>
+          <div class="pct" id="pct-5h">—</div>
+          <div class="track" id="track-5h">
+            <div class="fill" id="bar-5h" style="width:0%"></div>
+            <div class="wtick" id="tick-5h"></div>
+          </div>
+          <div class="mdetail" id="det-5h">—</div>
+        </div>
+        <div class="meter">
+          <div class="mhead">
+            <span class="mlabel">Weekly window</span>
+            <span class="mused" id="used-wk">—</span>
+          </div>
+          <div class="pct" id="pct-wk">—</div>
+          <div class="track" id="track-wk">
+            <div class="fill" id="bar-wk" style="width:0%"></div>
+            <div class="wtick" id="tick-wk"></div>
+          </div>
+          <div class="mdetail" id="det-wk">—</div>
+        </div>
+      </div>
+      <div class="peak-inline">
+        <h2>Peak hours <span class="h2sub" id="peak">—</span></h2>
+        <div class="stat"><span class="k" id="pk-change-k">Peak ends</span><span class="v" id="pk-change">—</span></div>
+        <div class="stat"><span class="k">Hours</span><span class="v" id="pk-win">—</span></div>
+        <div class="stat"><span class="k">Billing now</span><span class="v" id="pk-rate">—</span></div>
+        <div class="peak-cap" id="peak-cap">—</div>
+      </div>
+    </section>
+    <section class="card c-health">
+      <h2>Health</h2>
+      <div class="stat"><span class="k">Uptime</span><span class="v" id="uptime">—</span></div>
+      <div class="stat"><span class="k">Sessions</span><span class="v" id="sessions">—</span></div>
+      <div class="stat"><span class="k">In-flight classify</span><span class="v" id="inflight">—</span></div>
+      <div class="stat"><span class="k">Classify cache</span><span class="v" id="cache">—</span></div>
+      <div class="stat"><span class="k">Circuit breaker</span><span class="v" id="breaker">—</span></div>
+      <div class="stat"><span class="k">Single-flight hits</span><span class="v" id="sf-hits">—</span></div>
+      <div class="stat"><span class="k">Title-gen skips</span><span class="v" id="tg-skips">—</span></div>
+      <div class="stat"><span class="k">Compact skips</span><span class="v" id="cp-skips">—</span></div>
+      <div class="stat"><span class="k">Escalations</span><span class="v" id="esc">—</span></div>
+      <div class="stat"><span class="k">Budget breached</span><span class="v" id="breached">—</span></div>
+    </section>
+    <section class="card c-log">
+      <h2>Router log <span class="h2sub" id="log-sub">connecting…</span></h2>
+      <div id="logbox"></div>
+    </section>
+    <section class="card c-keys">
+      <h2>Keys (masked)</h2>
+      <div id="keys">—</div>
+    </section>
+    <section class="card c-repo">
+      <h2>Repo map</h2>
+      <div class="stat"><span class="k">Files</span><span class="v" id="rm-files">—</span></div>
+      <div class="stat"><span class="k">Bytes</span><span class="v" id="rm-bytes">—</span></div>
+      <div class="stat"><span class="k">Approx tokens</span><span class="v" id="rm-tokens">—</span></div>
+    </section>
+  </main>
+  <footer>polls /health every 8s · /credits every 15s · /logs every 3s · /keys once at load (keys change only on boot) · read-only · loopback by default</footer>
+  <noscript><p class="err">JavaScript is required — the dashboard renders live data client-side.</p></noscript>
+</div>
+<script>
+const $ = (id) => document.getElementById(id);
+var warnPct = 80;
+
+// ---- theme: system default, manual toggle persisted ----
+try {
+  const t = localStorage.getItem("csr-theme");
+  if (t === "light" || t === "dark") document.documentElement.setAttribute("data-theme", t);
+} catch (_) {}
+$("theme-btn").addEventListener("click", () => {
+  const root = document.documentElement;
+  const dark = root.getAttribute("data-theme") === "dark" ||
+    (root.getAttribute("data-theme") !== "light" &&
+      window.matchMedia("(prefers-color-scheme: dark)").matches);
+  root.setAttribute("data-theme", dark ? "light" : "dark");
+  try { localStorage.setItem("csr-theme", dark ? "light" : "dark"); } catch (_) {}
+});
+
+// ---- local clock (makes "your time" concrete next to every countdown) ----
+function tzLabel() {
+  const off = -new Date().getTimezoneOffset();
+  const sign = off < 0 ? "-" : "+";
+  const ah = Math.floor(Math.abs(off) / 60), am = Math.abs(off) % 60;
+  return "GMT" + sign + String(ah).padStart(2, "0") + (am ? ":" + String(am).padStart(2, "0") : "");
+}
+function tickClock() {
+  const n = new Date();
+  $("clock").textContent =
+    n.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }) + " · " + tzLabel();
+}
+
+// ---- formatters ----
+function fmtUptime(s) {
+  if (s == null) return "—";
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
+  if (h > 0) return h + "h " + m + "m";
+  return m + "m";
+}
+function fmtCountdown(min) {
+  if (min == null) return "—";
+  if (min <= 0) return "now";
+  const d = Math.floor(min / 1440), h = Math.floor((min % 1440) / 60), m = Math.floor(min % 60);
+  if (d > 0) return "in " + d + "d " + h + "h";
+  if (h > 0) return "in " + h + "h " + m + "m";
+  return "in " + m + "m";
+}
+function fmtDT(iso) { // "Wed, 26 Aug, 21:17" — in the VIEWER's timezone
+  return new Date(iso).toLocaleString(undefined,
+    { weekday: "short", day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
+}
+function fmtT(ms) { // "21:17" — viewer's timezone
+  return new Date(ms).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+function fmtNum(n) {
+  if (n == null) return "—";
+  if (n >= 1000) return Math.round(n).toLocaleString();
+  return (+n).toLocaleString(undefined, { maximumFractionDigits: 1 });
+}
+function fmtBytes(b) {
+  if (!b) return "—";
+  if (b >= 1024 * 1024) return (b / (1024 * 1024)).toFixed(1) + " MB";
+  return (b / 1024).toFixed(1) + " KB";
+}
+
+// ---- status pills: the dot carries the hue, the label carries meaning ----
+function pill(cls, text) {
+  return '<span class="pill ' + cls + '"><span class="dot"></span>' + text + "</span>";
+}
+
+// ---- credit meters: severity fill accent -> warn -> crit, same-hue track ----
+function meterColor(pct) {
+  if (pct == null) return "var(--muted)";
+  if (pct >= 100) return "var(--crit)";
+  if (pct >= warnPct) return "var(--warn)";
+  return "var(--accent)";
+}
+function setMeter(pctEl, fillEl, trackEl, pct) {
+  pctEl.textContent = pct == null ? "—" : pct + "%";
+  fillEl.style.width = (pct == null ? 0 : Math.min(100, pct)) + "%";
+  const c = meterColor(pct);
+  fillEl.style.background = c;
+  trackEl.style.background = "color-mix(in srgb, " + c + " 15%, transparent)";
+}
+
+// ---- credits card ----
+function renderCredits(c) {
+  warnPct = typeof c.warnPct === "number" ? c.warnPct : 80;
+  $("tick-5h").style.left = warnPct + "%";
+  $("tick-wk").style.left = warnPct + "%";
+  const fh = c.fiveHour || {}, wk = c.weekly || {}, p = c.peak || {};
+  setMeter($("pct-5h"), $("bar-5h"), $("track-5h"), fh.pct);
+  $("used-5h").textContent = fmtNum(fh.used) + " / " + fmtNum(fh.cap) + " credits";
+  $("det-5h").innerHTML = fh.clearsAt
+    ? "replenishes as spend ages out · clears <b>" + fmtT(Date.parse(fh.clearsAt)) + "</b> " +
+      fmtCountdown(fh.clearsInMin) + " if idle"
+    : (fh.used > 0
+        ? "replenishes as spend ages out"
+        : "no spend in the last 5 hours — full window");
+  setMeter($("pct-wk"), $("bar-wk"), $("track-wk"), wk.pct);
+  $("used-wk").textContent = fmtNum(wk.used) + " / " + fmtNum(wk.cap) + " credits";
+  $("det-wk").innerHTML = wk.resetsAt
+    ? "resets <b>" + fmtDT(wk.resetsAt) + "</b> · " + fmtCountdown(wk.resetsInMin)
+    : "rolling 7-day window — set credits.weeklyResetAnchor for the exact reset";
+  renderPeak(p);
+}
+function renderPeak(p) {
+  let tz = "";
+  try { tz = Intl.DateTimeFormat().resolvedOptions().timeZone || ""; } catch (_) {}
+  if (p.now) {
+    $("peak").innerHTML = pill("warn", "Peak now");
+    $("pk-change-k").textContent = "Peak ends";
+    $("pk-change").textContent = fmtT(Date.parse(p.changeAt)) + " · " + fmtCountdown(p.changeInMin);
+    $("pk-rate").textContent = "1× — full rate";
+  } else {
+    $("peak").innerHTML = pill("good", "Off-peak");
+    $("pk-change-k").textContent = "Next peak";
+    $("pk-change").textContent = fmtDT(p.changeAt) + " · " + fmtCountdown(p.changeInMin);
+    $("pk-rate").textContent = "0.5× — half rate";
+  }
+  $("pk-win").textContent = fmtT(Date.parse(p.windowStartAt)) + "–" +
+    fmtT(Date.parse(p.windowEndAt)) + (tz ? " (" + tz + ")" : "");
+  $("peak-cap").innerHTML = "Billing: 1× standard rate in peak · 0.5× off-peak " +
+    "(weekday nights + all weekend).";
+}
+function renderCreditsDisabled() {
+  $("pct-5h").textContent = "off";
+  $("pct-wk").textContent = "off";
+  $("used-5h").textContent = "";
+  $("used-wk").textContent = "";
+  $("det-5h").textContent = "set credits.enabled=true in config.json to track the GLM plan";
+  $("det-wk").textContent = "";
+  $("peak").innerHTML = pill("muted", "Disabled");
+  $("pk-change-k").textContent = "Peak ends";
+  $("pk-change").textContent = "—";
+  $("pk-win").textContent = "—";
+  $("pk-rate").textContent = "—";
+  $("peak-cap").textContent = "";
+}
+
+async function fetchJson(p) {
+  const r = await fetch(p);
+  if (!r.ok) throw new Error(p + " " + r.status);
+  return r.json();
+}
+async function pollHealth() {
+  try {
+    const h = await fetchJson("/health");
+    $("meta").textContent = "uptime " + fmtUptime(h.uptimeSeconds) + " · " + h.sessions +
+      " session" + (h.sessions === 1 ? "" : "s") + " · health 8s · credits 15s · log 3s";
+    $("status").innerHTML = h.status === "ok" ? pill("good", "OK") : pill("crit", "BAD");
+    $("uptime").textContent = fmtUptime(h.uptimeSeconds);
+    $("sessions").textContent = h.sessions;
+    $("inflight").textContent = h.classifyInFlight;
+    $("cache").textContent = h.classifyCacheSize;
+    const br = h.classifyBreaker || {};
+    $("breaker").innerHTML = br.open ? pill("crit", "Open") : pill("good", "Closed");
+    $("sf-hits").textContent = h.classifySingleFlightHits;
+    $("tg-skips").textContent = h.classifyTitleGenSkips;
+    $("cp-skips").textContent = h.classifyCompactSkips;
+    $("esc").textContent = h.totalEscalations;
+    $("breached").textContent = h.budgetBreachedSessions;
+    $("rm-files").textContent = h.repoMapFiles;
+    $("rm-bytes").textContent = fmtBytes(h.repoMapBytes);
+    $("rm-tokens").textContent = h.repoMapBytes ? Math.ceil(h.repoMapBytes / 4).toLocaleString() : "—";
+  } catch (e) {
+    $("meta").innerHTML = '<span class="err">poll failed: ' + e.message + " — retrying…</span>";
+  }
+}
+async function pollCredits() {
+  let c = null;
+  try { c = await fetchJson("/credits"); } catch (_) { return; }
+  if (c && c.enabled !== false) renderCredits(c);
+  else renderCreditsDisabled();
+}
+async function pollKeys(retry) {
+  try {
+    const k = await fetchJson("/keys");
+    const rows = Object.keys(k.keys || {}).map((name) =>
+      '<div class="stat"><span class="k">' + name + '</span><span class="v key">' + (k.keys[name] || "(not set)") + '</span></div>'
+    );
+    $("keys").innerHTML = rows.join("") || "(none)";
+  } catch (e) {
+    $("keys").innerHTML = '<span class="err">keys endpoint failed</span>';
+    if (retry) setTimeout(pollKeys, 5000);
+  }
+}
+var logCursor = 0;
+var logPinned = true;
+const logbox = $("logbox");
+logbox.addEventListener("scroll", () => {
+  logPinned = logbox.scrollTop + logbox.clientHeight >= logbox.scrollHeight - 6;
+}, { passive: true });
+function logRow(l) {
+  const div = document.createElement("div");
+  div.className = "ll " + (l.level || "log");
+  const t = document.createElement("span");
+  t.className = "lt";
+  t.textContent = new Date(l.t).toLocaleTimeString([], { hour12: false });
+  div.appendChild(t);
+  div.appendChild(document.createTextNode(" " + (l.text || "")));
+  return div;
+}
+async function pollLogs() {
+  try {
+    const j = await fetchJson("/logs?after=" + logCursor);
+    logCursor = typeof j.last === "number" ? j.last : logCursor;
+    const lines = j.lines || [];
+    if (lines.length) {
+      const ph = logbox.querySelector(".log-empty");
+      if (ph) ph.remove();
+      for (const l of lines) logbox.appendChild(logRow(l));
+      while (logbox.childNodes.length > 400) logbox.removeChild(logbox.firstChild);
+      $("log-sub").textContent = logbox.childNodes.length + " lines";
+      if (logPinned) logbox.scrollTop = logbox.scrollHeight;
+    } else if (logbox.childNodes.length === 0) {
+      logbox.innerHTML = '<span class="log-empty">(no router output yet)</span>';
+      $("log-sub").textContent = "0 lines";
+    }
+  } catch (e) {
+    $("log-sub").innerHTML = '<span class="err">log endpoint failed</span>';
+  }
+}
+tickClock();
+setInterval(tickClock, 1000);
+pollHealth();
+pollCredits();
+pollKeys(true);
+pollLogs();
+setInterval(pollHealth, 8000);
+setInterval(pollCredits, 15000);
+setInterval(pollLogs, 3000);
+</script>
+</body>
+</html>`;
+
 const server = http.createServer(async (req, res) => {
   // SECURITY: log the pathname only, not req.url — some Anthropic SDK
   // clients put the API key in the URL as ?key=sk-ant-..., which would
@@ -2508,7 +3074,26 @@ const server = http.createServer(async (req, res) => {
 
   if (req.method === "GET" && req.url === "/") {
     res.writeHead(200, { "content-type": "text/plain" });
-    res.end("claude-smart-router is running\n");
+    res.end("claude-smart-router is running\nSee /dashboard for the live UI.\n");
+    return;
+  }
+
+  // Read-only dashboard. Polls /health + /credits + /logs client-side
+  // (and /keys once at load — the keystore only changes on restart).
+  // Gated by checkAuth (routerToken if set) and checkRateLimit like every
+  // other route — no special-casing. Loopback-only by default.
+  if (req.method === "GET" && pathname === "/dashboard") {
+    res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+    res.end(DASHBOARD_HTML);
+    return;
+  }
+
+  // Masked keystore view — NEVER returns plaintext. Defense-in-depth even
+  // behind routerToken: a leaked dashboard token still can't exfiltrate
+  // raw API keys. Matches the maskKey() format used by `key list`.
+  if (req.method === "GET" && pathname === "/keys") {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ keys: maskedKeystore() }, null, 2));
     return;
   }
 
@@ -2557,6 +3142,23 @@ const server = http.createServer(async (req, res) => {
     }
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify(creditsSnapshot(), null, 2));
+    return;
+  }
+
+  // Tail of the router's own console output — exactly what the terminal
+  // shows (secret-shaped substrings were redacted at capture time, before
+  // anything entered the ring). Same auth + rate-limit gate as every other
+  // route. ?after=<seq> returns only newer lines so the dashboard appends
+  // incrementally instead of re-transferring the whole ring each poll.
+  if (req.method === "GET" && pathname === "/logs") {
+    const q = new URLSearchParams((req.url || "").split("?")[1] || "");
+    const after = Number.parseInt(q.get("after") || "0", 10) || 0;
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({
+      last: logSeq,
+      kept: logRing.length,
+      lines: after > 0 ? logRing.filter((l) => l.i > after) : logRing,
+    }));
     return;
   }
 
@@ -3090,7 +3692,10 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, HOST, () => {
   const displayHost = HOST === "0.0.0.0" || HOST === "::" ? "localhost" : HOST;
+  const dashboardUrl = `http://${displayHost}:${PORT}/dashboard`;
   console.log(`[router] listening on http://${displayHost}:${PORT} (bind: ${HOST})`);
+  console.log(`[router] dashboard: ${dashboardUrl}` + (OPEN_DASHBOARD_ON_START ? " (auto-opening browser)" : " (set openDashboardOnStart:true in config.json to auto-open)"));
+  if (OPEN_DASHBOARD_ON_START) openBrowser(dashboardUrl);
 
   if (config.__usingDefaults) {
     console.log(`[router] using bundled default config (${config.__configPath}) — GLM tiers, port ${PORT}.`);
@@ -3104,7 +3709,8 @@ server.listen(PORT, HOST, () => {
 
   console.log(`[router] classifier -> ${config.classifier.model} @ ${config.classifier.baseUrl}`);
   console.log(`[router] clarify=${CLARIFY_ENABLED}`);
-  console.log(`[router] debug=${DEBUG ? "on (per-request trace)" : "off (set debug:true in config or DEBUG=1)"}`);
+  console.log(`[router] debug=${DEBUG ? "on (per-request trace)" : "off (set debug:true in config or DEBUG=1)"}` +
+    (!DEBUG && DASHBOARD_DEBUG ? " · dashboardDebug=on (trace in the dashboard Router log only)" : ""));
   console.log(`[router] classifyCacheTtl=${CLASSIFY_CACHE_TTL_MS}ms heuristicPreFilter=enabled`);
   console.log(
     `[router] classifier: retries=${CLS_MAX_RETRIES} timeoutMs=${CLS_TIMEOUT_MS} ` +

@@ -1,6 +1,6 @@
 {
   "name": "claude-smart-router",
-  "version": "1.6.1",
+  "version": "1.6.4",
   "description": "Local proxy for Claude Code: routes requests between GLM/Claude by complexity and auto-clarifies ambiguous prompts.",
   "main": "router.js",
   "bin": {

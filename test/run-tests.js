@@ -1254,6 +1254,16 @@ async function runTests() {
       ok(snap.weekly.used >= 0.5 && snap.weekly.used <= 1.0, `weekly usage tracks same event (${snap.weekly.used})`);
       ok(snap.weekly.resetsInMin > 0 && snap.weekly.resetsInMin <= 60 * 24 * 7, "weekly reset within 7 days");
       ok(typeof snap.peak.now === "boolean" && typeof snap.peak.changeInMin === "number", "peak state reported");
+      // Instant-based fields the dashboard renders in the VIEWER's tz
+      ok(typeof snap.warnPct === "number", "warnPct reported for meter threshold tick");
+      const changeAt = Date.parse(snap.peak.changeAt);
+      ok(Number.isFinite(changeAt) && changeAt > Date.now() - 60_000 && changeAt <= Date.now() + 8 * 24 * 3600_000,
+        "peak changeAt is a near-future instant");
+      const ws = Date.parse(snap.peak.windowStartAt), we = Date.parse(snap.peak.windowEndAt);
+      ok(we - ws === 4 * 3600_000, "peak window is exactly 4h (14:00-18:00 SGT)");
+      const clears = Date.parse(snap.fiveHour.clearsAt);
+      ok(Number.isFinite(clears) && clears > Date.now() && clears <= Date.now() + 5 * 3600_000 + 5_000,
+        "5h clearsAt inside the sliding window");
       eq(snap.events, 1, "exactly one ledger event");
       // The classifier call must NOT be billed (unknown model -> skipped)
       await post("/v1/messages", msgBody({ messages: [{ role: "user", content: "and another thing entirely different" }] }));
@@ -2259,6 +2269,118 @@ async function runTests() {
     await stopRouter();
     clearClassifierControls();
   });
+
+  // ---------------- dashboard ----------------
+  console.log("\n== suite: dashboard ==");
+  clearRouterStdout();
+  await startRouter(CFG_JSON, { ROUTES_PATH: NO_ROUTES });
+
+  await test("dashboard: GET /dashboard returns 200 + self-contained HTML", async () => {
+    const res = await fetch(`http://localhost:${ROUTER_PORT}/dashboard`);
+    eq(res.status, 200, "status 200");
+    eq(res.headers.get("content-type"), "text/html; charset=utf-8", "html content-type");
+    const text = await res.text();
+    ok(text.startsWith("<!doctype html>"), "starts with doctype");
+    ok(text.includes("<title>claude-smart-router</title>"), "has router title");
+    // The dashboard must poll the existing endpoints to render live data —
+    // a static page without these would be useless. (The HTML wraps fetch in
+    // a fetchJson() helper, so we look for the wrapper calls.)
+    ok(text.includes('fetchJson("/health")'), "polls /health");
+    ok(text.includes('fetchJson("/credits")'), "polls /credits");
+    ok(text.includes('fetchJson("/keys")'), "polls /keys");
+    ok(text.includes('fetchJson("/logs'), "tails /logs");
+    ok(text.includes('id="pct-5h"'), "renders 5h credit gauge");
+    ok(text.includes('id="breaker"'), "renders breaker status");
+    // Refresh cadence: health 8s, credits 15s, logs 3s. Keys are fetched
+    // ONCE (keystore changes only on restart) — no pollKeys interval.
+    ok(text.includes("setInterval(pollHealth, 8000)"), "health refreshes every 8s");
+    ok(text.includes("setInterval(pollCredits, 15000)"), "credits refresh every 15s");
+    ok(text.includes("setInterval(pollLogs, 3000)"), "log tail refreshes every 3s");
+    ok(!text.includes("setInterval(pollKeys"), "keys are NOT re-polled");
+    // v1.6.2 dashboard: reset countdown + peak hours in the viewer's tz;
+    // v1.6.3: compact peak status card + router log tail
+    ok(text.includes('id="pk-change"'), "renders peak countdown stat");
+    ok(text.includes('id="pk-rate"'), "renders peak billing rate stat");
+    ok(text.includes('id="logbox"'), "renders the router log tail box");
+    ok(text.includes('id="det-wk"'), "renders weekly reset detail line");
+    ok(text.includes('id="clock"'), "renders local clock + tz offset");
+    ok(text.includes("resets <b>"), "weekly detail shows the local reset instant");
+  });
+
+  await test("logs: GET /logs tails the router's own console output", async () => {
+    const res = await fetch(`http://localhost:${ROUTER_PORT}/logs`);    eq(res.status, 200, "status 200");
+    eq(res.headers.get("content-type"), "application/json", "json content-type");
+    const j = await res.json();
+    ok(Array.isArray(j.lines), "lines array");
+    ok(j.lines.length > 0, "boot output captured in the ring");
+    ok(j.lines.some((l) => (l.text || "").includes("[router] listening on")),
+      "the terminal's listening line is in the tail");
+    ok(j.lines.every((l) => typeof l.i === "number" && typeof l.text === "string"),
+      "line shape {i, text}");
+    // Cursor: ?after=<seq> returns only NEWER lines — the dashboard's
+    // append-only tail depends on this.
+    const res2 = await fetch(`http://localhost:${ROUTER_PORT}/logs?after=${j.last}`);
+    const j2 = await res2.json();
+    ok(j2.lines.every((l) => l.i > j.last), "cursor skips already-seen lines");
+  });
+
+  await test("dashboard debug: dashboard.debug mirrors the trace to /logs but not stdout", async () => {
+    // Separate flag: terminal stays quiet (debug off), the dashboard's
+    // Router log card still gets the per-request trace.
+    const cfg = buildConfig();
+    cfg.dashboard = { debug: true };
+    const p = path.join(LOG_DIR, "config-dashdebug.json");
+    fs.writeFileSync(p, JSON.stringify(cfg, null, 2));
+    await stopRouter();
+    clearRouterStdout();
+    await startRouter(p, { ROUTES_PATH: NO_ROUTES });
+    await fetch(`http://localhost:${ROUTER_PORT}/health`); // any request emits a trace line
+    const j = await (await fetch(`http://localhost:${ROUTER_PORT}/logs`)).json();
+    ok(j.lines.some((l) => (l.text || "").includes("[router:debug]")),
+      "per-request trace captured in the /logs ring");
+    ok(!routerStdout().includes("[router:debug]"),
+      "terminal stdout stays quiet (debug off, dashboard.debug on)");
+    await stopRouter();
+    // restore this suite's router for the tests that follow
+    await startRouter(CFG_JSON, { ROUTES_PATH: NO_ROUTES });
+  });
+
+  await test("dashboard: GET /keys returns masks only — never plaintext", async () => {
+    const res = await fetch(`http://localhost:${ROUTER_PORT}/keys`);
+    eq(res.status, 200, "status 200");
+    eq(res.headers.get("content-type"), "application/json", "json content-type");
+    const j = await res.json();
+    ok(j && typeof j.keys === "object", "has keys object");
+    // All three known key names present (regardless of whether they're set).
+    for (const name of ["route", "classifier", "router"]) {
+      ok(name in j.keys, `key "${name}" present`);
+    }
+    // Defense-in-depth: the dashboard endpoint must NEVER return a raw
+    // API key, even when one is stored in the keystore. Test config isolates
+    // HOME to LOG_DIR so the keystore is empty — every value should read
+    // "(not set)" — but we still assert the masking invariant for safety
+    // in case a future test config populates the keystore.
+    for (const name of Object.keys(j.keys)) {
+      const v = j.keys[name];
+      ok(v === "(not set)" || v.includes("..."), `key "${name}" is masked, not plaintext: ${v}`);
+    }
+  });
+
+  await test("dashboard: GET / mentions /dashboard for discoverability", async () => {
+    const res = await fetch(`http://localhost:${ROUTER_PORT}/`);
+    eq(res.status, 200, "status 200");
+    const text = await res.text();
+    ok(text.includes("/dashboard"), "root endpoint points users at the dashboard URL");
+  });
+
+  await test("dashboard: startup log prints the dashboard URL", async () => {
+    // The whole point of phase 1 is discoverability — pin the boot line
+    // so a future refactor doesn't silently remove it.
+    ok(routerStdout().includes("[router] dashboard:"), "startup stdout includes dashboard URL line");
+    ok(routerStdout().includes("/dashboard"), "startup stdout includes the /dashboard path");
+  });
+
+  await stopRouter();
 
   // ---------------- summary ----------------
   console.log(`\n=========================================`);

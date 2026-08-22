@@ -413,6 +413,31 @@ async function main() {
     await stopRouter();
   });
 
+  // --------- S7b: the /logs dashboard tail redacts what stdout redacts ---------
+  console.log("\n== suite: S7b — /logs tail redaction ==");
+
+  await test("S7b: /logs tail redacts secret-shaped prompt content", async () => {
+    // The dashboard's router-log card mirrors the terminal. Debug mode
+    // previews the last user turn — a pasted API key in that preview must
+    // reach NEITHER stdout NOR the /logs ring it is served from.
+    const cfg = buildConfig({ debug: true });
+    const p = writeCfg("sec-logs-redact.json", cfg);
+    await startRouter(p, { ROUTES_PATH: path.join(LOG_DIR, "no-routes.md") });
+    setReply(JSON.stringify({ complexity: "medium", clarity: "clear", assumptions: [] }));
+    const FAKE = "sk-ant-api03-fakekeydeadbeefdeadbeef998877";
+    await post("/v1/messages", msgBody({
+      messages: [{ role: "user", content: "store this key " + FAKE + " thanks" }],
+    }));
+    const res = await fetch(`http://localhost:${ROUTER_PORT}/logs`);
+    eq(res.status, 200, "status 200");
+    const j = await res.json();
+    ok(Array.isArray(j.lines) && j.lines.length > 0, "ring captured output");
+    const flat = (j.lines || []).map((l) => l.text).join("\n");
+    ok(!flat.includes(FAKE), "the pasted key never appears in /logs");
+    ok(flat.includes("[REDACTED]"), "redaction marker present instead");
+    await stopRouter();
+  });
+
   // --------- summary ---------
   console.log("\n=========================================");
   console.log(`RESULT: ${passed} passed, ${failed} failed`);

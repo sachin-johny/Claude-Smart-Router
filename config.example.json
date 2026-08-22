@@ -12,6 +12,12 @@
 
   "rateLimit": null,
 
+  "openDashboardOnStart": false,
+
+  "dashboard": {
+    "debug": false
+  },
+
   "tools": {
     "minComplexity": "medium",
     "model": null

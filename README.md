@@ -250,10 +250,39 @@ Set `ROUTER_ENV_PATH` if you want the env file somewhere other than next to
   classifier circuit breaker state, in-flight count, and skip stats),
   handy for process managers and uptime checks.
 - `GET /credits` — live GLM Coding Plan usage: 5h/weekly totals and
-  percentages, peak-hour state, and the next reset time (see below).
+  percentages, the weekly reset instant, when the 5h window replenishes,
+  and peak-hour state with the next change as an absolute instant (see
+  below).
 - `GET /map` — inspect the current repo map (see below).
 - `POST /map/refresh` — rebuild the repo map cache. Call after `git pull`,
   reorg, or any time the cached map has gone stale.
+- `GET /logs` — tail of the router's own console output (last 400 lines,
+  the same redaction as stdout). Supports `?after=<seq>` so clients append
+  incrementally; the dashboard's "Router log" card uses this to mirror the
+  terminal live. Set `"dashboard": { "debug": true }` in `config.json` to
+  capture the per-request debug trace in the dashboard log **without**
+  printing it to the terminal (or env `DASHBOARD_DEBUG=1`) — separate from
+  the main `debug` flag, which prints and mirrors.
+- `GET /dashboard` — self-contained read-only HTML dashboard. Zero external
+  resources, no build step, no new files in the package (the HTML lives
+  inside `router.js`). Gated by `routerToken` + `rateLimit` like every other
+  route — loopback-only by default. The router logs the dashboard URL on
+  startup. To auto-launch a browser on boot, set
+  `"openDashboardOnStart": true` in `config.json` (off by default; silently
+  no-ops on headless boxes without `$DISPLAY`/`$WAYLAND_DISPLAY`).
+  Poll cadence: `/health` every 8s, `/credits` every 15s, `/logs` every 3s;
+  `/keys` is fetched once at load (the keystore only changes on restart).
+  Everything time-related renders in **your** timezone: the weekly reset
+  ("resets Wed, 26 Aug, 21:17 — in 4d 3h"), when the 5h window clears, and
+  a compact peak card — on/off pill, "Peak ends / Next peak" countdown, the
+  local clock equivalent of the Mon–Fri 14:00–18:00 SGT window, and the
+  billing rate in effect (1× in peak, 0.5× off-peak). A "Router log" card
+  tails the terminal output next to it. Light and dark themes follow your
+  system, with a manual toggle.
+- `GET /keys` — masked view of the keystore (`route` / `classifier` /
+  `router`), same format as `key list`. **Never returns plaintext** —
+  defense-in-depth so a leaked dashboard token still can't exfiltrate raw
+  API keys.
 
 ### Classifier resilience knobs (v1.5.0)
 
@@ -482,6 +511,12 @@ Plan's two windows:
 - `GET /credits` returns the full snapshot; `/health` carries the
   percentages. The ledger persists to `credits-state.json` (debounced,
   flushed on shutdown), so restarts don't lose the weekly total.
+  The snapshot's time fields are absolute instants (`weekly.resetsAt`,
+  `fiveHour.clearsAt`, `peak.changeAt` / `peak.windowStartAt` /
+  `peak.windowEndAt`, plus matching `*InMin` countdowns and `warnPct`)
+  so any client — the dashboard, your scripts — can render them in
+  whatever timezone it runs in. The dashboard shows the weekly reset
+  and the peak windows on your local clock, never Singapore's.
 - Known blind spot: traffic that bypasses the router (Z.AI MCP tools,
   direct API clients) is invisible — treat the numbers as a lower bound.
 
@@ -506,6 +541,65 @@ Plan's two windows:
   recent assistant replies, not the full conversation — usually enough to
   judge complexity, but very context-dependent requests may be misjudged.
 - Single-process; no clustering. Fine for a personal proxy's load.
+
+## Changes in 1.6.4 (config: dashboard.debug)
+
+New `"dashboard": { "debug": true }` config flag (or `DASHBOARD_DEBUG=1`
+env): capture the per-request debug trace in the dashboard's Router log
+card **without** printing it to the terminal. `debug: true` still does
+both. The boot summary notes when it's active.
+
+## Changes in 1.6.3 (dashboard: peak status card, router log tail, saner polling)
+
+The peak card was a full-width week strip at the bottom — lots of space,
+little information density. It's now a compact half-width status card
+directly under the credits meters, and the terminal itself moved into the
+dashboard next to it.
+
+- New `GET /logs` — ring buffer of the router's last 400 console lines
+  (boot summary, routing decisions, warnings, debug trace), redacted with
+  the same secret patterns as stdout. `?after=<seq>` returns only newer
+  lines. The dashboard's "Router log" card tails it every 3s, appends
+  incrementally, and sticks to the bottom unless you scroll up — what the
+  terminal shows, without the terminal.
+- Peak status card: on/off pill, "Peak ends / Next peak" with local clock
+  time + countdown, the peak window translated to your timezone
+  (e.g. `08:00–12:00 (Europe/Berlin)`), the fixed `Mon–Fri 14:00–18:00`
+  SGT window, and the billing rate in effect — 1× full rate in peak,
+  0.5× off-peak (weekday nights + weekends), per the Z.AI plan docs.
+  The week strip is gone; the card answers the same questions in a
+  fraction of the space.
+- Poll cadence matches how fast each source actually changes: health 8s,
+  credits 15s, log tail 3s. `/keys` is fetched **once** at load — the
+  keystore is read at boot and only changes on restart, so re-polling it
+  was noise.
+
+## Changes in 1.6.2 (dashboard: resets + peak hours in your timezone)
+
+The dashboard showed a bare "Weekly window" percentage with no reset
+time, and peak hours only as a countdown against Singapore's clock —
+useless for answering "when does my week refresh?" and "when is peak
+*for me*?". Both answers now render in the viewer's own timezone, and
+the dashboard got a proper visual pass (reference data-viz palette,
+light + dark themes, system font, responsive layout).
+
+- `/credits` grows instant-based fields so clients can localize:
+  `weekly.resetsAt` (already existed) now joined by
+  `fiveHour.clearsAt` (when the sliding window fully replenishes),
+  `peak.changeAt` / `peak.windowStartAt` / `peak.windowEndAt`, and
+  top-level `warnPct`. Internally `minutesUntilPeakChange()` is now
+  derived from a shared `peakWindow()` helper (current-or-next window
+  as absolute instants) — one source of truth for hints and snapshot.
+- Dashboard weekly meter shows "resets Wed, 26 Aug, 21:17 · in 4d 3h"
+  in local time; the 5h meter shows when the window clears if idle.
+- Peak card: current/off-peak state with the next change as a local
+  clock time, plus a Mon–Sun week strip placing each day's 14:00–18:00
+  SGT peak block on your local 24h lane with a now-marker — computed
+  from instants, so it stays correct across timezones, midnight-
+  straddling windows, and your own DST changes.
+- The in-conversation peak hint now appends the machine-local
+  translation of the SGT window (e.g. `14:00-18:00 UTC+8 = 08:00-12:00
+  on this machine`).
 
 ## Changes in 1.6.0 (readable upstream error logs)
 
