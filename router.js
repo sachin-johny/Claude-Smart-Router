@@ -2988,7 +2988,7 @@ const DASHBOARD_HTML = `<!doctype html>
           <div class="pct" id="pct-5h">—</div>
           <div class="track" id="track-5h">
             <div class="fill" id="bar-5h" style="width:0%"></div>
-            <div class="wtick" id="tick-5h"></div>
+            <div id="tick-5h"></div>
           </div>
           <div class="mdetail" id="det-5h">—</div>
           <div class="macct" id="acct-5h"></div>
@@ -3001,7 +3001,7 @@ const DASHBOARD_HTML = `<!doctype html>
           <div class="pct" id="pct-wk">—</div>
           <div class="track" id="track-wk">
             <div class="fill" id="bar-wk" style="width:0%"></div>
-            <div class="wtick" id="tick-wk"></div>
+            <div id="tick-wk"></div>
           </div>
           <div class="mdetail" id="det-wk">—</div>
           <div class="macct" id="acct-wk"></div>
