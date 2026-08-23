@@ -46,6 +46,7 @@
   "budgetReject": false,
 
   "credits": {
+    "zaiAccountUsage": true,
     "enabled": true,
     "plan": "lite",
     "caps": { "fiveHour": 2000, "weekly": 10000 },
