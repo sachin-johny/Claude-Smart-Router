@@ -73,7 +73,7 @@ produces is byte-for-byte what `npm publish` uploads:
 
 ```bash
 npm pack                       # -> claude-smart-router-<version>.tgz
-npm install -g ./claude-smart-router-1.6.1.tgz
+npm install -g ./claude-smart-router-x.x.x.tgz
 ```
 
 You can also install straight from the checkout, no tarball needed:
@@ -86,7 +86,7 @@ Upgrading is the same command re-run — npm replaces the previous version.
 To check what's actually inside a tarball before installing:
 
 ```bash
-tar -tzf claude-smart-router-1.6.1.tgz
+tar -tzf claude-smart-router-x.x.x.tgz
 ```
 
 To remove it entirely:
