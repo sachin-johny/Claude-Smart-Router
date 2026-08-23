@@ -2334,7 +2334,10 @@ async function runTests() {
     await stopRouter();
     clearRouterStdout();
     await startRouter(p, { ROUTES_PATH: NO_ROUTES });
-    await fetch(`http://localhost:${ROUTER_PORT}/health`); // any request emits a trace line
+    // Any NON-dashboard-poll path emits a trace line — /health & co. are
+    // excluded from the per-request trace (the dashboard's own polling would
+    // drown the ring), so hit `/` instead.
+    await fetch(`http://localhost:${ROUTER_PORT}/`);
     const j = await (await fetch(`http://localhost:${ROUTER_PORT}/logs`)).json();
     ok(j.lines.some((l) => (l.text || "").includes("[router:debug]")),
       "per-request trace captured in the /logs ring");
