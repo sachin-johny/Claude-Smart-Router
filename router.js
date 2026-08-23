@@ -425,6 +425,16 @@ function debugLog(...args) {
   else if (DASHBOARD_DEBUG) captureConsoleLine("log", ["[router:debug]", ...safe]);
   // neither flag set — skip the trace entirely
 }
+// z.ai account-usage overlay trace: gated ONLY by dashboard.debug, not the
+// main debug flag — this poll runs on its own timer independent of request
+// traffic, so tying it to `debug: true` would mean either living with it in
+// the main terminal trace or losing it entirely. Always ring-only (never
+// printed to stdout), regardless of what DEBUG is set to.
+function zaiDebugLog(...args) {
+  if (!DASHBOARD_DEBUG) return;
+  const safe = args.map(redactForLog);
+  captureConsoleLine("log", ["[router:debug]", ...safe]);
+}
 
 // ---- /logs ring buffer --------------------------------------------
 // Everything the router prints to the terminal is mirrored here (after
@@ -1105,7 +1115,17 @@ function saveCreditState() {
     // atomic rename carries the inode (and thus the mode) over.
     fs.writeFileSync(
       p + ".tmp",
-      JSON.stringify({ v: 1, events: creditEvents, warnLevels: creditWarnLevels }),
+      JSON.stringify({
+        v: 1,
+        events: creditEvents,
+        warnLevels: creditWarnLevels,
+        // Last-known z.ai account usage (see zaiUsageCache further down
+        // this file). Only written when a poll actually succeeded, so a
+        // stale/never-worked value is never persisted. Read back at boot
+        // — before the live poll finishes — so the dashboard's first
+        // paint shows real numbers instead of "not polled yet".
+        zaiUsage: (typeof zaiUsageCache !== "undefined" && zaiUsageCache?.ok) ? zaiUsageCache : undefined,
+      }),
       { mode: 0o600 }
     );
     fs.renameSync(p + ".tmp", p);
@@ -1126,6 +1146,206 @@ function saveCreditState() {
     console.log(`[router] credits: restored ${creditEvents.length} event(s) from ${p}`);
   } catch (_) { /* no state file yet — fine */ }
 })();
+
+// ---------------------------------------------------------------
+// Z.ai ACCOUNT usage (ground truth from the provider, not the router's
+// own ledger). Two undocumented endpoints Z.ai's own web dashboard
+// calls — no official docs, no stability guarantee, response shape
+// reverse-engineered from community tooling (e.g. the "Z.ai GLM Usage
+// Tracker" VS Code extension). Treat this as a best-effort overlay
+// that also closes the router's known blind spot: usage that bypasses
+// the router entirely (other API clients, Z.AI MCP tools) still shows
+// up here because it's billed on the account, not observed in-flight.
+//
+// Disabled by default unless credits.zaiAccountUsage=true — an extra
+// outbound call to Z.ai on a timer isn't something to do silently.
+// ---------------------------------------------------------------
+
+const ZAI_USAGE_ENABLED = CREDITS_ENABLED && CREDITS_CFG.zaiAccountUsage === true;
+const ZAI_USAGE_POLL_MS = Math.max(10_000, CREDITS_CFG.zaiAccountUsagePollMs || 60_000);
+const ZAI_USAGE_TIMEOUT_MS = CREDITS_CFG.zaiAccountUsageTimeoutMs || 8_000;
+const ZAI_MONITOR_BASE = "https://api.z.ai/api/monitor/usage";
+
+// Resolve which API key to send: explicit override first, then env,
+// then "whichever configured route/classifier points at z.ai" — since
+// that's almost certainly the GLM Coding Plan key already in use.
+function resolveZaiApiKey() {
+  if (CREDITS_CFG.zaiApiKey) return CREDITS_CFG.zaiApiKey;
+  if (process.env.ZAI_API_KEY) return process.env.ZAI_API_KEY;
+  for (const route of Object.values(config.routes || {})) {
+    if (route.apiKey && /z\.ai/i.test(route.baseUrl || "")) return route.apiKey;
+  }
+  if (config.classifier?.apiKey && /z\.ai/i.test(config.classifier.baseUrl || "")) {
+    return config.classifier.apiKey;
+  }
+  return null;
+}
+
+let zaiUsageCache = { ok: false, fetchedAt: null, error: "not polled yet", fiveHour: null, weekly: null, raw: null };
+
+// Seed from disk before the first live poll runs. Network round-trips
+// take real time (up to ZAI_USAGE_TIMEOUT_MS); this means a restart
+// still shows last-known account usage immediately instead of a blank
+// "not polled yet" placeholder while the fresh poll is in flight.
+// `cached: true` lets the dashboard mark it as "as of <time>" rather
+// than implying it's live.
+(function loadCachedZaiUsage() {
+  if (!ZAI_USAGE_ENABLED) return;
+  try {
+    const p = creditsStatePath();
+    const st = JSON.parse(fs.readFileSync(p, "utf8"));
+    if (st.zaiUsage && st.zaiUsage.ok) {
+      zaiUsageCache = { ...st.zaiUsage, cached: true };
+      console.log(`[router] credits: restored last-known z.ai account usage from ${p} (fetched ${st.zaiUsage.fetchedAt}) — refreshing now`);
+    }
+  } catch (_) { /* no state file yet, or no zaiUsage recorded — fine, live poll will populate it */ }
+})();
+
+// Best-effort field extraction: the endpoints are undocumented, so
+// don't assume exact key names — try the common shapes and fall back
+// to shipping the raw payload so the dashboard (or a curious human)
+// can still make sense of it even if this guesses wrong.
+function pickNum(obj, keys) {
+  for (const k of keys) {
+    const v = obj?.[k];
+    if (typeof v === "number" && Number.isFinite(v)) return v;
+  }
+  return null;
+}
+
+// Z.ai's monitor endpoint returns `data.limits[]`, not a single `{ used, cap }`
+// object. Keep the old scalar-shape fallback for forward/backward compatibility,
+// but normalize the real limit records without inventing values that the API did
+// not send. `percentage` is provider-reported usage percentage. For TIME_LIMIT,
+// `currentValue / usage` gives an actual used/cap pair; token-limit rows often only
+// expose percentage + reset metadata.
+function normalizeLimitRecord(limit) {
+  if (!limit || typeof limit !== "object") return null;
+  const used = pickNum(limit, ["currentValue", "used", "consumed", "tokensUsed", "used_tokens"]);
+  const cap = pickNum(limit, ["usage", "limit", "cap", "total", "quota", "max_tokens", "total_tokens"]);
+  let pct = pickNum(limit, ["percentage", "percent", "pct", "usage_percent", "used_percent"]);
+  if (pct === null && used !== null && cap !== null && cap > 0) pct = Math.round((used / cap) * 100);
+  return {
+    type: limit.type || null,
+    unit: pickNum(limit, ["unit"]),
+    number: pickNum(limit, ["number"]),
+    usage: pickNum(limit, ["usage"]),
+    used,
+    cap,
+    remaining: pickNum(limit, ["remaining"]),
+    pct,
+    nextResetTime: pickNum(limit, ["nextResetTime"]),
+    usageDetails: Array.isArray(limit.usageDetails)
+      ? limit.usageDetails.map((d) => ({
+          modelCode: d?.modelCode || null,
+          usage: pickNum(d, ["usage", "currentValue", "used"])
+        })).filter((d) => d.modelCode || d.usage != null)
+      : [],
+  };
+}
+
+function normalizeQuota(json) {
+  const d = json?.data ?? json?.result ?? json ?? {};
+  if (Array.isArray(d.limits)) {
+    const limits = d.limits.map(normalizeLimitRecord).filter(Boolean);
+    const tokenLimits = limits.filter((x) => x.type === "TOKENS_LIMIT");
+    const timeLimit = limits.find((x) => x.type === "TIME_LIMIT") || null;
+    if (!limits.length) return null;
+    return {
+      source: "limits",
+      limits,
+      tokenLimits,
+      timeLimit,
+      // Backward-compatible scalar aliases: do not pretend these are the
+      // router's 5-hour/weekly plan-credit windows. They merely expose the
+      // first matching provider quota when one exists.
+      used: limits[0].used,
+      cap: limits[0].cap,
+      pct: limits[0].pct,
+    };
+  }
+
+  // Older/alternate scalar response shape.
+  const used = pickNum(d, ["used", "usage", "consumed", "tokensUsed", "used_tokens"]);
+  const cap = pickNum(d, ["limit", "cap", "total", "quota", "max_tokens", "total_tokens"]);
+  let pct = pickNum(d, ["percentage", "percent", "pct", "usage_percent", "used_percent"]);
+  if (pct === null && used !== null && cap) pct = Math.round((used / cap) * 100);
+  if (used === null && cap === null && pct === null) return null;
+  return { used, cap, pct, source: "scalar", limits: [], tokenLimits: [], timeLimit: null };
+}
+
+async function fetchZaiJson(url, apiKey) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), ZAI_USAGE_TIMEOUT_MS);
+  timer.unref();
+  try {
+    const res = await fetch(url, {
+      headers: { authorization: `Bearer ${apiKey}` },
+      signal: controller.signal,
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const text = await res.text();
+    if (!text.trim()) return null; // endpoint may return HTTP 200 with an empty body
+    try {
+      return JSON.parse(text);
+    } catch (e) {
+      throw new Error(`invalid JSON: ${e.message}`);
+    }
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function pollZaiAccountUsage() {
+  if (!ZAI_USAGE_ENABLED) return;
+  const apiKey = resolveZaiApiKey();
+  if (!apiKey) {
+    zaiUsageCache = { ok: false, fetchedAt: new Date().toISOString(), error: "no z.ai API key resolved (set credits.zaiApiKey, ZAI_API_KEY, or a route pointed at z.ai)", fiveHour: null, weekly: null, raw: null };
+    zaiDebugLog(`z.ai account usage: skipped — ${zaiUsageCache.error}`);
+    return;
+  }
+  zaiDebugLog(`z.ai account usage: polling ${ZAI_MONITOR_BASE}/quota/limit + /model-usage (key=${apiKey.slice(0, 6)}...)`);
+  try {
+    const [quota, modelUsage] = await Promise.all([
+      fetchZaiJson(`${ZAI_MONITOR_BASE}/quota/limit`, apiKey),
+      fetchZaiJson(`${ZAI_MONITOR_BASE}/model-usage`, apiKey).catch((e) => ({ __error: e.message })),
+    ]);
+    const normalizedQuota = normalizeQuota(quota);
+    const normalizedModelUsage = modelUsage && !modelUsage.__error ? normalizeQuota(modelUsage) : null;
+    zaiUsageCache = {
+      ok: true,
+      fetchedAt: new Date().toISOString(),
+      error: null,
+      // The quota endpoint is the useful source for the dashboard. Its real
+      // shape is `limits[]`, so expose token/time quotas explicitly.
+      quota: normalizedQuota,
+      modelUsage: normalizedModelUsage,
+      // Backward compatibility for any consumer still reading these fields.
+      // They are only aliases for the normalized endpoint data, not the
+      // router's own 5h/weekly credit ledger.
+      fiveHour: normalizedQuota,
+      weekly: normalizedModelUsage,
+      raw: (DEBUG || DASHBOARD_DEBUG) ? { quota, modelUsage } : undefined, // only keep raw in a debug mode — may contain account details
+    };
+    zaiDebugLog(
+      `z.ai account usage: quota/limit -> ${JSON.stringify(quota).slice(0, 300)}`,
+      `| parsed quota=${JSON.stringify(normalizedQuota)}`
+    );
+    zaiDebugLog(
+      modelUsage?.__error
+        ? `z.ai account usage: model-usage failed -> ${modelUsage.__error}`
+        : `z.ai account usage: model-usage -> ${JSON.stringify(modelUsage).slice(0, 300)} | parsed modelUsage=${JSON.stringify(normalizedModelUsage)}`
+    );
+    if (!normalizedQuota) {
+      zaiDebugLog(`z.ai account usage: quota/limit response didn't match any known shape — see GET /credits (zaiAccount.raw) with dashboard.debug:true for the raw payload`);
+    } else {
+      saveCreditState(); // write-through so a restart can seed from this immediately (see loadCachedZaiUsage above)
+    }
+  } catch (e) {
+    zaiUsageCache = { ok: false, fetchedAt: new Date().toISOString(), error: e.message, fiveHour: null, weekly: null, raw: null };
+    zaiDebugLog(`z.ai account usage: poll failed — ${e.message}`);
+  }
+}
 
 // ---------------------------------------------------------------
 // API key resolution: env vars override config.json
@@ -1150,6 +1370,17 @@ function saveCreditState() {
     if (process.env[envVar]) routeCfg.apiKey = process.env[envVar];
   }
 })();
+
+// Z.ai account-usage polling: interval registered here (after env
+// overrides, so it never uses a stale key — see the comment above).
+// The FIRST poll is deliberately NOT fired here: it's awaited right
+// before server.listen() in the Startup section below, so the
+// dashboard's very first load already has fresh account data instead
+// of racing an in-flight request.
+if (ZAI_USAGE_ENABLED) {
+  const zaiUsageTimer = setInterval(pollZaiAccountUsage, ZAI_USAGE_POLL_MS);
+  zaiUsageTimer.unref();
+}
 
 // ---------------------------------------------------------------
 // External classification prompt (ROUTES.md)
@@ -2607,7 +2838,7 @@ const DASHBOARD_HTML = `<!doctype html>
     --page: #f9f9f7; --surface: #fcfcfb;
     --ink: #0b0b0b; --ink-2: #52514e; --muted: #898781;
     --grid: #e1e0d9; --baseline: #c3c2b7; --border: rgba(11,11,11,0.10);
-    --accent: #2a78d6; --good: #0ca30c; --warn: #fab219; --crit: #d03b3b;
+    --accent: #2a78d6; --good: #0ca30c; --caution: #d9b21a; --warn: #fab219; --crit: #d03b3b;
     --wash-good: rgba(12,163,12,0.10); --wash-warn: rgba(250,178,25,0.14);
     --wash-warn-strong: rgba(250,178,25,0.28); --wash-crit: rgba(208,59,59,0.10);
     --wash-muted: rgba(137,135,129,0.14);
@@ -2618,7 +2849,7 @@ const DASHBOARD_HTML = `<!doctype html>
       --page: #0d0d0d; --surface: #1a1a19;
       --ink: #ffffff; --ink-2: #c3c2b7; --muted: #898781;
       --grid: #2c2c2a; --baseline: #383835; --border: rgba(255,255,255,0.10);
-      --accent: #3987e5; --good: #0ca30c; --warn: #fab219; --crit: #d03b3b;
+      --accent: #3987e5; --good: #0ca30c; --caution: #d9b21a; --warn: #fab219; --crit: #d03b3b;
       --wash-good: rgba(12,163,12,0.16); --wash-warn: rgba(250,178,25,0.16);
       --wash-warn-strong: rgba(250,178,25,0.32); --wash-crit: rgba(208,59,59,0.16);
       --wash-muted: rgba(137,135,129,0.20);
@@ -2629,7 +2860,7 @@ const DASHBOARD_HTML = `<!doctype html>
     --page: #0d0d0d; --surface: #1a1a19;
     --ink: #ffffff; --ink-2: #c3c2b7; --muted: #898781;
     --grid: #2c2c2a; --baseline: #383835; --border: rgba(255,255,255,0.10);
-    --accent: #3987e5; --good: #0ca30c; --warn: #fab219; --crit: #d03b3b;
+    --accent: #3987e5; --good: #0ca30c; --caution: #d9b21a; --warn: #fab219; --crit: #d03b3b;
     --wash-good: rgba(12,163,12,0.16); --wash-warn: rgba(250,178,25,0.16);
     --wash-warn-strong: rgba(250,178,25,0.32); --wash-crit: rgba(208,59,59,0.16);
     --wash-muted: rgba(137,135,129,0.20);
@@ -2663,6 +2894,14 @@ const DASHBOARD_HTML = `<!doctype html>
   .c-credits h2 { margin-bottom: 8px; }
   .h2sub { text-transform: none; letter-spacing: 0; font-size: 12px;
     font-weight: 500; display: flex; align-items: center; gap: 8px; }
+  .refresh-btn { border: none; background: transparent; color: var(--muted);
+    width: 20px; height: 20px; border-radius: 6px; cursor: pointer; font-size: 13px;
+    line-height: 1; padding: 0; margin-left: auto; flex: none; }
+  .refresh-btn:hover:not(:disabled) { color: var(--ink); background: var(--wash-muted); }
+  .refresh-btn:disabled { cursor: default; opacity: 0.6; }
+  .refresh-btn.spinning { animation: refresh-spin 0.8s linear infinite; }
+  @keyframes refresh-spin { to { transform: rotate(360deg); } }
+  @media (prefers-reduced-motion: reduce) { .refresh-btn.spinning { animation: none; } }
   .mdetail b, .peak-cap b { color: var(--ink-2); font-weight: 600; }
   /* credit meters */
   .meters { display: grid; grid-template-columns: 1fr 1fr; gap: 18px 26px; }
@@ -2677,6 +2916,12 @@ const DASHBOARD_HTML = `<!doctype html>
   .wtick { position: absolute; top: -3px; bottom: -3px; width: 1px; background: var(--baseline); }
   .mdetail { margin-top: 9px; font-size: 12px; color: var(--muted); }
   .c-credits .mdetail { margin-top: 6px; }
+  /* z.ai account-usage overlay: router's own ledger vs the provider's
+     account truth, when credits.zaiAccountUsage=true. Empty + hidden
+     when the overlay is off or hasn't reported yet. */
+  .macct { margin-top: 4px; font-size: 11px; color: var(--muted); }
+  .macct b { color: var(--ink-2); font-weight: 600; }
+  .macct.stale { color: var(--crit); }
   /* peak status caption */
   .peak-cap { margin-top: 12px; font-size: 12px; color: var(--muted); }
   /* peak hours, nested inside the credits card, filling the space below the meters */
@@ -2733,11 +2978,11 @@ const DASHBOARD_HTML = `<!doctype html>
   <div class="sub" id="meta">connecting…</div>
   <main>
     <section class="card c-credits">
-      <h2>GLM Coding Plan credits</h2>
+      <h2>GLM Coding Plan credits <span class="h2sub" id="zai-freshness"></span><button class="refresh-btn" id="refresh-credits" aria-label="Refresh usage now" title="Refresh usage now">⟳</button></h2>
       <div class="meters">
         <div class="meter">
           <div class="mhead">
-            <span class="mlabel">5-hour window</span>
+            <span class="mlabel" id="label-5h">5-hour window</span>
             <span class="mused" id="used-5h">—</span>
           </div>
           <div class="pct" id="pct-5h">—</div>
@@ -2746,10 +2991,11 @@ const DASHBOARD_HTML = `<!doctype html>
             <div class="wtick" id="tick-5h"></div>
           </div>
           <div class="mdetail" id="det-5h">—</div>
+          <div class="macct" id="acct-5h"></div>
         </div>
         <div class="meter">
           <div class="mhead">
-            <span class="mlabel">Weekly window</span>
+            <span class="mlabel" id="label-wk">Weekly window</span>
             <span class="mused" id="used-wk">—</span>
           </div>
           <div class="pct" id="pct-wk">—</div>
@@ -2758,6 +3004,7 @@ const DASHBOARD_HTML = `<!doctype html>
             <div class="wtick" id="tick-wk"></div>
           </div>
           <div class="mdetail" id="det-wk">—</div>
+          <div class="macct" id="acct-wk"></div>
         </div>
       </div>
       <div class="peak-inline">
@@ -2868,12 +3115,17 @@ function pill(cls, text) {
   return '<span class="pill ' + cls + '"><span class="dot"></span>' + text + "</span>";
 }
 
-// ---- credit meters: severity fill accent -> warn -> crit, same-hue track ----
+// ---- credit meters: 4-stage severity fill good -> caution -> warn -> crit,
+// same-hue track. The middle two transitions scale off warnPct (default 80)
+// instead of fixed percentages, so raising/lowering warnPct in config also
+// moves where the bar starts looking urgent — e.g. warnPct=80 gives
+// green <40%, yellow 40-79%, orange 80-99%, red 100%+. ----
 function meterColor(pct) {
   if (pct == null) return "var(--muted)";
   if (pct >= 100) return "var(--crit)";
   if (pct >= warnPct) return "var(--warn)";
-  return "var(--accent)";
+  if (pct >= warnPct / 2) return "var(--caution)";
+  return "var(--good)";
 }
 function setMeter(pctEl, fillEl, trackEl, pct) {
   pctEl.textContent = pct == null ? "—" : pct + "%";
@@ -2889,20 +3141,113 @@ function renderCredits(c) {
   $("tick-5h").style.left = warnPct + "%";
   $("tick-wk").style.left = warnPct + "%";
   const fh = c.fiveHour || {}, wk = c.weekly || {}, p = c.peak || {};
-  setMeter($("pct-5h"), $("bar-5h"), $("track-5h"), fh.pct);
-  $("used-5h").textContent = fmtNum(fh.used) + " / " + fmtNum(fh.cap) + " credits";
-  $("det-5h").innerHTML = fh.clearsAt
-    ? "replenishes as spend ages out · clears <b>" + fmtT(Date.parse(fh.clearsAt)) + "</b> " +
-      fmtCountdown(fh.clearsInMin) + " if idle"
-    : (fh.used > 0
-        ? "replenishes as spend ages out"
-        : "no spend in the last 5 hours — full window");
-  setMeter($("pct-wk"), $("bar-wk"), $("track-wk"), wk.pct);
-  $("used-wk").textContent = fmtNum(wk.used) + " / " + fmtNum(wk.cap) + " credits";
-  $("det-wk").innerHTML = wk.resetsAt
-    ? "resets <b>" + fmtDT(wk.resetsAt) + "</b> · " + fmtCountdown(wk.resetsInMin)
-    : "rolling 7-day window — set credits.weeklyResetAnchor for the exact reset";
+  const acct = c.zaiAccount;
+  const zaiReachable = !!(acct && acct.ok === true);
+  const quota = zaiReachable ? (acct.quota || acct.fiveHour) : null;
+  const tokenLimits = Array.isArray(quota?.tokenLimits) ? [...quota.tokenLimits] : [];
+  tokenLimits.sort((a, b) => (Number(a.unit) || 0) - (Number(b.unit) || 0));
+  const t0 = tokenLimits[0] || null;
+  const t1 = tokenLimits[1] || null;
+
+  // Refresh button only makes sense when the overlay is actually
+  // configured (credits.zaiAccountUsage=true server-side) — hidden
+  // entirely otherwise, since clicking it would just no-op.
+  refreshBtn.style.display = acct ? "" : "none";
+  const freshness = $("zai-freshness");
+  freshness.textContent = acct?.cached
+    ? "cached" + (acct.fetchedAt ? " · as of " + fmtT(Date.parse(acct.fetchedAt)) : "")
+    : "";
+
+  if (zaiReachable) {
+    // When Z.ai is reachable, these meters are the provider's TOKEN_LIMIT
+    // quotas — never the router's priced-credit ledger. A reachable provider
+    // with an unexpected shape stays "—" rather than silently falling back.
+    // Labels are fixed window names, not the raw unit/number fields Z.ai
+    // sends (those don't mean "hours"/"requests" the way they look — see
+    // parseTokenLimits comment above) — and the big percentage + bar
+    // already communicate the usage number, so no separate "X% used" text.
+    $("label-5h").textContent = "5-hour window";
+    $("used-5h").textContent = "";
+    if (t0) {
+      setMeter($("pct-5h"), $("bar-5h"), $("track-5h"), t0.pct);
+      $("det-5h").innerHTML = t0.nextResetTime != null
+        ? "resets <b>" + fmtDT(t0.nextResetTime) + "</b>"
+        : "provider quota reset unavailable";
+    } else {
+      setMeter($("pct-5h"), $("bar-5h"), $("track-5h"), null);
+      $("det-5h").textContent = "Z.ai returned no token-quota entry";
+    }
+
+    $("label-wk").textContent = "Weekly window";
+    $("used-wk").textContent = "";
+    if (t1) {
+      setMeter($("pct-wk"), $("bar-wk"), $("track-wk"), t1.pct);
+      $("det-wk").innerHTML = t1.nextResetTime != null
+        ? "resets <b>" + fmtDT(t1.nextResetTime) + "</b>"
+        : "provider quota reset unavailable";
+    } else {
+      setMeter($("pct-wk"), $("bar-wk"), $("track-wk"), null);
+      $("det-wk").textContent = "Z.ai returned no second token-quota entry";
+    }
+
+    const title = document.querySelector(".c-credits h2");
+    if (title) title.firstChild.textContent = "Z.ai token quota";
+  } else {
+    // Only use the router's priced-credit ledger when the provider poll is
+    // unavailable/failed. This is intentionally NOT a fallback for a
+    // reachable-but-unrecognized Z.ai response.
+    $("label-5h").textContent = "5-hour window";
+    setMeter($("pct-5h"), $("bar-5h"), $("track-5h"), fh.pct);
+    $("used-5h").textContent = fmtNum(fh.used) + " / " + fmtNum(fh.cap) + " credits";
+    $("det-5h").innerHTML = fh.clearsAt
+      ? "replenishes as spend ages out · clears <b>" + fmtDT(fh.clearsAt) + "</b> " +
+        fmtCountdown(fh.clearsInMin) + " if idle"
+      : (fh.used > 0
+          ? "replenishes as spend ages out"
+          : "no spend in the last 5 hours — full window");
+
+    $("label-wk").textContent = "Weekly window";
+    setMeter($("pct-wk"), $("bar-wk"), $("track-wk"), wk.pct);
+    $("used-wk").textContent = fmtNum(wk.used) + " / " + fmtNum(wk.cap) + " credits";
+    $("det-wk").innerHTML = wk.resetsAt
+      ? "resets <b>" + fmtDT(wk.resetsAt) + "</b> · " + fmtCountdown(wk.resetsInMin)
+      : "rolling 7-day window — set credits.weeklyResetAnchor for the exact reset";
+
+    const title = document.querySelector(".c-credits h2");
+    if (title) title.firstChild.textContent = "GLM Coding Plan credits";
+  }
+
+  renderZaiAccount(c.zaiAccount);
   renderPeak(p);
+}
+// ---- z.ai account-usage overlay: provider's own numbers, vs the
+// router's ledger above. null/absent when credits.zaiAccountUsage
+// isn't enabled; .ok:false when the last poll failed (stale badge).
+function renderZaiAccount(acct) {
+  const a5 = $("acct-5h"), awk = $("acct-wk");
+  if (!acct) { a5.textContent = ""; awk.textContent = ""; return; }
+  a5.classList.toggle("stale", !acct.ok);
+  awk.classList.toggle("stale", !acct.ok);
+  if (!acct.ok) {
+    a5.textContent = "Z.ai account unavailable: " + (acct.error || "provider unreachable");
+    awk.textContent = "Using local credit ledger as fallback.";
+    return;
+  }
+  const quota = acct.quota || acct.fiveHour;
+  const timeLimit = quota?.timeLimit || null;
+  if (timeLimit) {
+    const details = Array.isArray(timeLimit.usageDetails) && timeLimit.usageDetails.length
+      ? " · " + timeLimit.usageDetails.map((d) => d.modelCode + ": " + (d.usage ?? "—")).join(", ")
+      : "";
+    awk.innerHTML = "Z.ai tool/search quota: <b>" + (timeLimit.pct ?? "—") + "%</b>" +
+      (timeLimit.used != null && timeLimit.cap != null
+        ? " (" + fmtNum(timeLimit.used) + " / " + fmtNum(timeLimit.cap) + ")"
+        : "") +
+      (timeLimit.nextResetTime != null ? " · resets " + fmtT(timeLimit.nextResetTime) : "") + details;
+  } else {
+    awk.textContent = "Z.ai tool/search quota unavailable";
+  }
+  a5.textContent = "";
 }
 function renderPeak(p) {
   let tz = "";
@@ -2924,12 +3269,17 @@ function renderPeak(p) {
     "(weekday nights + all weekend).";
 }
 function renderCreditsDisabled() {
+  $("label-5h").textContent = "5-hour window";
   $("pct-5h").textContent = "off";
   $("pct-wk").textContent = "off";
   $("used-5h").textContent = "";
   $("used-wk").textContent = "";
   $("det-5h").textContent = "set credits.enabled=true in config.json to track the GLM plan";
   $("det-wk").textContent = "";
+  $("acct-5h").textContent = "";
+  $("acct-wk").textContent = "";
+  $("zai-freshness").textContent = "";
+  refreshBtn.style.display = "none";
   $("peak").innerHTML = pill("muted", "Disabled");
   $("pk-change-k").textContent = "Peak ends";
   $("pk-change").textContent = "—";
@@ -2943,6 +3293,30 @@ async function fetchJson(p) {
   if (!r.ok) throw new Error(p + " " + r.status);
   return r.json();
 }
+async function postJson(p) {
+  const r = await fetch(p, { method: "POST" });
+  if (!r.ok) throw new Error(p + " " + r.status);
+  return r.json();
+}
+// ---- manual refresh: bypasses the poll interval on demand ----
+let zaiRefreshing = false;
+const refreshBtn = $("refresh-credits");
+refreshBtn.addEventListener("click", async () => {
+  if (zaiRefreshing) return;
+  zaiRefreshing = true;
+  refreshBtn.disabled = true;
+  refreshBtn.classList.add("spinning");
+  try {
+    const data = await postJson("/credits/refresh");
+    if (data && data.enabled !== false) renderCredits(data);
+  } catch (_) {
+    // swallow — button just stops spinning, next scheduled poll retries anyway
+  } finally {
+    zaiRefreshing = false;
+    refreshBtn.disabled = false;
+    refreshBtn.classList.remove("spinning");
+  }
+});
 async function pollHealth() {
   try {
     const h = await fetchJson("/health");
@@ -3034,13 +3408,22 @@ setInterval(pollLogs, 3000);
 </body>
 </html>`;
 
+// Dashboard polling endpoints are simple, deterministic reads — tracing
+// every 3s /logs or 8s /health poll here just produces noise about the
+// dashboard fetching its own noise. Excluded from the per-request debug
+// line regardless of debug/dashboard.debug; everything else (actual
+// routing requests, /map, external health checks, etc.) is still traced.
+const DASHBOARD_POLL_PATHS = new Set(["/health", "/credits", "/logs", "/keys", "/dashboard"]);
+
 const server = http.createServer(async (req, res) => {
   // SECURITY: log the pathname only, not req.url — some Anthropic SDK
   // clients put the API key in the URL as ?key=sk-ant-..., which would
   // land in stdout/logs/journald verbatim. The pathname is enough for
   // debugging routing decisions.
   const pathname = (req.url || "").split("?")[0];
-  debugLog(`<- ${req.method} ${pathname}`);
+  if (!DASHBOARD_POLL_PATHS.has(pathname)) {
+    debugLog(`<- ${req.method} ${pathname}`);
+  }
 
   // Dispatch on the path only — Claude Code appends query strings
   // (e.g. /v1/messages?beta=true), and an exact-string match would
@@ -3141,7 +3524,30 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify(creditsSnapshot(), null, 2));
+    res.end(JSON.stringify({
+      ...creditsSnapshot(),
+      // Best-effort overlay from Z.ai's own account (see zaiUsageCache
+      // above): undocumented endpoints, off by default. Null when
+      // credits.zaiAccountUsage isn't set to true.
+      zaiAccount: ZAI_USAGE_ENABLED ? zaiUsageCache : null,
+    }, null, 2));
+    return;
+  }
+
+  // Manual refresh: forces an immediate z.ai account-usage poll instead
+  // of waiting for the next interval tick. Used by the dashboard's
+  // refresh button. Cheap to expose — same auth/rate-limit gate as
+  // every other route above, and pollZaiAccountUsage() already has its
+  // own timeout so this can't hang the request indefinitely.
+  if (req.method === "POST" && pathname === "/credits/refresh") {
+    if (!CREDITS_ENABLED || !ZAI_USAGE_ENABLED) {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ enabled: false, note: "credits.enabled and credits.zaiAccountUsage must both be true in config.json" }, null, 2));
+      return;
+    }
+    await pollZaiAccountUsage();
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ ...creditsSnapshot(), zaiAccount: zaiUsageCache }, null, 2));
     return;
   }
 
@@ -3690,149 +4096,169 @@ const server = http.createServer(async (req, res) => {
 // Startup
 // ---------------------------------------------------------------
 
-server.listen(PORT, HOST, () => {
-  const displayHost = HOST === "0.0.0.0" || HOST === "::" ? "localhost" : HOST;
-  const dashboardUrl = `http://${displayHost}:${PORT}/dashboard`;
-  console.log(`[router] listening on http://${displayHost}:${PORT} (bind: ${HOST})`);
-  console.log(`[router] dashboard: ${dashboardUrl}` + (OPEN_DASHBOARD_ON_START ? " (auto-opening browser)" : " (set openDashboardOnStart:true in config.json to auto-open)"));
-  if (OPEN_DASHBOARD_ON_START) openBrowser(dashboardUrl);
-
-  if (config.__usingDefaults) {
-    console.log(`[router] using bundled default config (${config.__configPath}) — GLM tiers, port ${PORT}.`);
-    console.log(`[router] drop a config.json in ${process.cwd()} to customize.`);
+(async function start() {
+  // Block startup on the FIRST z.ai account-usage poll (bounded by
+  // ZAI_USAGE_TIMEOUT_MS, so a hung network can't hang the router
+  // forever) — this is what makes the dashboard's very first load show
+  // real numbers instead of "not polled yet"/stale-cache placeholders.
+  // Subsequent polls happen on the interval registered above and don't
+  // block anything.
+  if (ZAI_USAGE_ENABLED) {
+    console.log(`[router] credits: fetching z.ai account usage before startup (max ${ZAI_USAGE_TIMEOUT_MS}ms)...`);
+    await pollZaiAccountUsage();
   }
 
-  // Log all configured routes
-  for (const [name, route] of Object.entries(config.routes)) {
-    console.log(`[router] ${name} -> ${route.model} @ ${route.baseUrl}`);
-  }
+  server.listen(PORT, HOST, () => {
+    const displayHost = HOST === "0.0.0.0" || HOST === "::" ? "localhost" : HOST;
+    const dashboardUrl = `http://${displayHost}:${PORT}/dashboard`;
+    console.log(`[router] listening on http://${displayHost}:${PORT} (bind: ${HOST})`);
+    console.log(`[router] dashboard: ${dashboardUrl}` + (OPEN_DASHBOARD_ON_START ? " (auto-opening browser)" : " (set openDashboardOnStart:true in config.json to auto-open)"));
+    if (OPEN_DASHBOARD_ON_START) openBrowser(dashboardUrl);
 
-  console.log(`[router] classifier -> ${config.classifier.model} @ ${config.classifier.baseUrl}`);
-  console.log(`[router] clarify=${CLARIFY_ENABLED}`);
-  console.log(`[router] debug=${DEBUG ? "on (per-request trace)" : "off (set debug:true in config or DEBUG=1)"}` +
-    (!DEBUG && DASHBOARD_DEBUG ? " · dashboardDebug=on (trace in the dashboard Router log only)" : ""));
-  console.log(`[router] classifyCacheTtl=${CLASSIFY_CACHE_TTL_MS}ms heuristicPreFilter=enabled`);
-  console.log(
-    `[router] classifier: retries=${CLS_MAX_RETRIES} timeoutMs=${CLS_TIMEOUT_MS} ` +
-    `deadlineMs=${CLS_DEADLINE_MS} backoff=${CLS_BACKOFF_BASE_MS}-${CLS_BACKOFF_MAX_MS}ms ` +
-    `jitter=±${Math.round(CLS_BACKOFF_JITTER * 100)}% singleFlight=${CLS_SINGLE_FLIGHT ? "on" : "off"} ` +
-    `titleGenSkip=${CLS_TITLEGEN_SKIP ? "on" : "off"} compactSkip=${CLS_COMPACT_SKIP ? "on" : "off"}` +
-    (CLS_COMPACT_SKIP ? ` (compactHardMsgThreshold=${CLS_COMPACT_HARD_MSG_THRESHOLD})` : "")
-  );
-  console.log(
-    `[router] classifier: breaker=${CLS_BREAKER_THRESHOLD > 0 ? `threshold=${CLS_BREAKER_THRESHOLD} cooldown=${CLS_BREAKER_COOLDOWN_MS}ms` : "disabled"}`
-  );
-  if (CLS_TIMEOUT_MS > CLS_DEADLINE_MS) {
-    console.warn(`[router] classifier: timeoutMs (${CLS_TIMEOUT_MS}) > deadlineMs (${CLS_DEADLINE_MS}); deadline will cap per-attempt budget`);
-  }
-  if (BUDGET_MAX) console.log(`[router] budgetMax=${BUDGET_MAX} budgetReject=${BUDGET_REJECT}`);
-  else console.log(`[router] budgetMax=none (set budgetMax in config.json to enforce)`);
-  console.log(`[router] autoEscalation=enabled (max ${MAX_ESCALATIONS_PER_SESSION}/session, on failure patterns + 5xx)`);
-  console.log(`[router] compactHint=${COMPACT_HINT_TURNS > 0 ? `at ${COMPACT_HINT_TURNS} turns` : "disabled"} (set compactHintTurns in config.json to adjust)`);
-  if (CREDITS_ENABLED) {
+    if (config.__usingDefaults) {
+      console.log(`[router] using bundled default config (${config.__configPath}) — GLM tiers, port ${PORT}.`);
+      console.log(`[router] drop a config.json in ${process.cwd()} to customize.`);
+    }
+
+    // Log all configured routes
+    for (const [name, route] of Object.entries(config.routes)) {
+      console.log(`[router] ${name} -> ${route.model} @ ${route.baseUrl}`);
+    }
+
+    console.log(`[router] classifier -> ${config.classifier.model} @ ${config.classifier.baseUrl}`);
+    console.log(`[router] clarify=${CLARIFY_ENABLED}`);
+    console.log(`[router] debug=${DEBUG ? "on (per-request trace)" : "off (set debug:true in config or DEBUG=1)"}` +
+      (!DEBUG && DASHBOARD_DEBUG ? " · dashboardDebug=on (trace in the dashboard Router log only)" : ""));
+    console.log(`[router] classifyCacheTtl=${CLASSIFY_CACHE_TTL_MS}ms heuristicPreFilter=enabled`);
     console.log(
-      `[router] credits: tracking GLM plan — ${CREDIT_CAPS.fiveHour}/5h + ${CREDIT_CAPS.weekly}/wk, ` +
-        `warn at ${CREDITS_WARN_PCT}%, hints=${CREDITS_HINTS ? "on" : "off"}, off-peak=0.5x ` +
-        `(peak Mon-Fri 14:00-18:00 UTC+8)`
+      `[router] classifier: retries=${CLS_MAX_RETRIES} timeoutMs=${CLS_TIMEOUT_MS} ` +
+      `deadlineMs=${CLS_DEADLINE_MS} backoff=${CLS_BACKOFF_BASE_MS}-${CLS_BACKOFF_MAX_MS}ms ` +
+      `jitter=±${Math.round(CLS_BACKOFF_JITTER * 100)}% singleFlight=${CLS_SINGLE_FLIGHT ? "on" : "off"} ` +
+      `titleGenSkip=${CLS_TITLEGEN_SKIP ? "on" : "off"} compactSkip=${CLS_COMPACT_SKIP ? "on" : "off"}` +
+      (CLS_COMPACT_SKIP ? ` (compactHardMsgThreshold=${CLS_COMPACT_HARD_MSG_THRESHOLD})` : "")
     );
-    if (Number.isFinite(CREDITS_ANCHOR_MS)) {
-      console.log(`[router] credits: weekly cycle resets ${new Date(weeklyResetAt()).toLocaleString()} local (anchor ${CREDITS_CFG.weeklyResetAnchor})`);
-    } else {
-      console.log(`[router] credits: no weeklyResetAnchor set — weekly window is a rolling 7 days (approximate)`);
+    console.log(
+      `[router] classifier: breaker=${CLS_BREAKER_THRESHOLD > 0 ? `threshold=${CLS_BREAKER_THRESHOLD} cooldown=${CLS_BREAKER_COOLDOWN_MS}ms` : "disabled"}`
+    );
+    if (CLS_TIMEOUT_MS > CLS_DEADLINE_MS) {
+      console.warn(`[router] classifier: timeoutMs (${CLS_TIMEOUT_MS}) > deadlineMs (${CLS_DEADLINE_MS}); deadline will cap per-attempt budget`);
     }
-  } else {
-    console.log(`[router] credits=disabled (set credits.enabled=true in config.json)`);
-  }
-  if (CREDITS_CFG.weeklyResetAnchor && !Number.isFinite(CREDITS_ANCHOR_MS)) {
-    console.warn(`[router] credits: weeklyResetAnchor is not a valid date: ${JSON.stringify(CREDITS_CFG.weeklyResetAnchor)}`);
-  }
-  console.log(`[router] upstreamTimeout=${UPSTREAM_TIMEOUT_MS}ms maxSessions=${MAX_SESSIONS} maxBody=${(MAX_BODY_BYTES / (1024 * 1024)).toFixed(0)}MB`);
-  console.log(`[router] tools.minComplexity=${TOOLS_MIN_COMPLEXITY}` +
-    (TOOLS_FIXED_MODEL ? ` tools.model=${TOOLS_FIXED_MODEL}` : ""));
-
-  // Key audit: a route without any resolvable key fails every request
-  // with an upstream 401 — better to name it at startup. Ollama
-  // backends (no auth) are exempt. Placeholder-looking values count as
-  // missing, since they'd 401 identically.
-  const PLACEHOLDER_RE = /^(PASTE_|your_|xxx+$|test-)/i;
-  const looksPlaceholder = (v) => !v || PLACEHOLDER_RE.test(v);
-  const keyIssues = [];
-  const routeKeySources = [];
-  for (const [name, route] of Object.entries(config.routes)) {
-    const isOllama = route.provider === "ollama" || (route.baseUrl || "").includes("11434");
-    if (isOllama) continue;
-    const hasKey = !looksPlaceholder(route.apiKey);
-    if (!hasKey) keyIssues.push(`route "${name}" (${route.model}) has no API key`);
-    routeKeySources.push([name, hasKey]);
-  }
-  const classifier = config.classifier;
-  if (classifier && !(classifier.provider === "ollama" || (classifier.baseUrl || "").includes("11434"))) {
-    if (looksPlaceholder(classifier.apiKey)) {
-      keyIssues.push(`classifier (${classifier.model}) has no API key`);
-    }
-  }
-  if (keyIssues.length) {
-    console.warn(`[router] WARNING: ${keyIssues.length} backend${keyIssues.length > 1 ? "s" : ""} will reject every request:`);
-    for (const issue of keyIssues) console.warn(`[router]   - ${issue}`);
-    console.warn(`[router] Fix: claude-smart-router key set route   (or ROUTE_API_KEY / .env / per-route apiKey in config)`);
-    if (keyIssues.some((i) => i.startsWith("classifier"))) {
-      console.warn(`[router]       claude-smart-router key set classifier`);
-    }
-  }
-
-  if (ROUTER_TOKEN) console.log(`[router] proxyAuth=enabled`);
-  else console.log(`[router] proxyAuth=disabled (set routerToken in config or ROUTER_TOKEN env to enable)`);
-
-  if (RATE_LIMIT_RPM > 0) {
-    console.log(`[router] rateLimit=${RATE_LIMIT_RPM}rpm burst=+${RATE_LIMIT_BURST} trustXff=${RATE_LIMIT_CFG?.trustXff === true}`);
-  } else {
-    console.log(`[router] rateLimit=disabled (set rateLimit.rpm in config to enable)`);
-  }
-
-  if (routesTemplate) console.log(`[router] routesTemplate=ROUTES.md (keyword mode)`);
-  else console.log(`[router] routesTemplate=built-in (JSON mode)`);
-
-  // Repo map: build eagerly so the first request doesn't pay the walk
-  // cost, and so a misconfigured root surfaces at startup instead of
-  // silently producing an empty map on turn 1.
-  if (REPO_MAP_ENABLED) {
-    const map = buildRepoMap();
-    if (map) {
+    if (BUDGET_MAX) console.log(`[router] budgetMax=${BUDGET_MAX} budgetReject=${BUDGET_REJECT}`);
+    else console.log(`[router] budgetMax=none (set budgetMax in config.json to enforce)`);
+    console.log(`[router] autoEscalation=enabled (max ${MAX_ESCALATIONS_PER_SESSION}/session, on failure patterns + 5xx)`);
+    console.log(`[router] compactHint=${COMPACT_HINT_TURNS > 0 ? `at ${COMPACT_HINT_TURNS} turns` : "disabled"} (set compactHintTurns in config.json to adjust)`);
+    if (CREDITS_ENABLED) {
       console.log(
-        `[router] repoMap=enabled root=${REPO_MAP_ROOT} files=${repoMapFileCount} ` +
-        `bytes=${repoMapBytes} (~${Math.ceil(repoMapBytes / 4)} tokens, every request, frozen per session, min=${REPO_MAP_MIN_COMPLEXITY})`
+        `[router] credits: tracking GLM plan — ${CREDIT_CAPS.fiveHour}/5h + ${CREDIT_CAPS.weekly}/wk, ` +
+          `warn at ${CREDITS_WARN_PCT}%, hints=${CREDITS_HINTS ? "on" : "off"}, off-peak=0.5x ` +
+          `(peak Mon-Fri 14:00-18:00 UTC+8)`
       );
-      console.log(`[router] repoMap: GET /map to inspect, POST /map/refresh to rebuild (new sessions only)`);
-    } else {
-      console.log(`[router] repoMap=enabled but no source files found under ${REPO_MAP_ROOT} (map will be skipped)`);
-    }
-    // Early validation of pinned files: warn now if any are missing or
-    // unreadable, so the user discovers config typos at startup instead
-    // of after sending their first message and seeing nothing injected.
-    if (REPO_MAP_PINNED_FILES.length) {
-      const pinned = readPinnedFiles();
-      const found = new Set(pinned.map((p) => p.path));
-      const missing = REPO_MAP_PINNED_FILES.filter((p) => !found.has(p));
-      if (missing.length) {
-        console.warn(`[router] repoMap: pinned file(s) not found/readable: ${missing.join(", ")}`);
+      if (Number.isFinite(CREDITS_ANCHOR_MS)) {
+        console.log(`[router] credits: weekly cycle resets ${new Date(weeklyResetAt()).toLocaleString()} local (anchor ${CREDITS_CFG.weeklyResetAnchor})`);
+      } else {
+        console.log(`[router] credits: no weeklyResetAnchor set — weekly window is a rolling 7 days (approximate)`);
       }
-      const pinnedBytes = pinned.reduce((n, f) => n + f.bytes, 0);
-      console.log(
-        `[router] repoMap: pinnedFiles=${pinned.length}/${REPO_MAP_PINNED_FILES.length}` +
-        (pinned.length ? ` (~${Math.ceil(pinnedBytes / 4)} tokens, max ${REPO_MAP_PINNED_MAX_BYTES}B each)` : "")
-      );
+      if (ZAI_USAGE_ENABLED) {
+        const zaiKey = resolveZaiApiKey();
+        console.log(`[router] credits: z.ai account usage overlay=on (polling every ${ZAI_USAGE_POLL_MS}ms, undocumented endpoint — best effort)` +
+          (zaiKey ? ` — using key ${zaiKey.slice(0, 6)}...${zaiKey.slice(-4)}` : " — WARNING: no API key resolved, every poll will fail"));
+      } else {
+        console.log(`[router] credits: z.ai account usage overlay=off (set credits.zaiAccountUsage=true in config.json)`);
+      }
+    } else {
+      console.log(`[router] credits=disabled (set credits.enabled=true in config.json)`);
     }
-    if (REPO_MAP_WRITE_TO_FILE) {
-      console.log(`[router] repoMap: writeToFile=${REPO_MAP_WRITE_TO_FILE} (use @include in CLAUDE.md for every-turn visibility)`);
+    if (CREDITS_CFG.weeklyResetAnchor && !Number.isFinite(CREDITS_ANCHOR_MS)) {
+      console.warn(`[router] credits: weeklyResetAnchor is not a valid date: ${JSON.stringify(CREDITS_CFG.weeklyResetAnchor)}`);
     }
-    const thresholds = Object.entries(REPO_MAP_COMPACT_AFTER)
-      .map(([k, v]) => `${k}=${v}`)
-      .join(" ");
-    console.log(`[router] repoMap: compactAfter=${thresholds} (real user turns; tool round-trips don't count)`);
-  } else {
-    console.log(`[router] repoMap=disabled (set repoMap.enabled=true in config.json to enable)`);
-  }
-});
+    console.log(`[router] upstreamTimeout=${UPSTREAM_TIMEOUT_MS}ms maxSessions=${MAX_SESSIONS} maxBody=${(MAX_BODY_BYTES / (1024 * 1024)).toFixed(0)}MB`);
+    console.log(`[router] tools.minComplexity=${TOOLS_MIN_COMPLEXITY}` +
+      (TOOLS_FIXED_MODEL ? ` tools.model=${TOOLS_FIXED_MODEL}` : ""));
+
+    // Key audit: a route without any resolvable key fails every request
+    // with an upstream 401 — better to name it at startup. Ollama
+    // backends (no auth) are exempt. Placeholder-looking values count as
+    // missing, since they'd 401 identically.
+    const PLACEHOLDER_RE = /^(PASTE_|your_|xxx+$|test-)/i;
+    const looksPlaceholder = (v) => !v || PLACEHOLDER_RE.test(v);
+    const keyIssues = [];
+    const routeKeySources = [];
+    for (const [name, route] of Object.entries(config.routes)) {
+      const isOllama = route.provider === "ollama" || (route.baseUrl || "").includes("11434");
+      if (isOllama) continue;
+      const hasKey = !looksPlaceholder(route.apiKey);
+      if (!hasKey) keyIssues.push(`route "${name}" (${route.model}) has no API key`);
+      routeKeySources.push([name, hasKey]);
+    }
+    const classifier = config.classifier;
+    if (classifier && !(classifier.provider === "ollama" || (classifier.baseUrl || "").includes("11434"))) {
+      if (looksPlaceholder(classifier.apiKey)) {
+        keyIssues.push(`classifier (${classifier.model}) has no API key`);
+      }
+    }
+    if (keyIssues.length) {
+      console.warn(`[router] WARNING: ${keyIssues.length} backend${keyIssues.length > 1 ? "s" : ""} will reject every request:`);
+      for (const issue of keyIssues) console.warn(`[router]   - ${issue}`);
+      console.warn(`[router] Fix: claude-smart-router key set route   (or ROUTE_API_KEY / .env / per-route apiKey in config)`);
+      if (keyIssues.some((i) => i.startsWith("classifier"))) {
+        console.warn(`[router]       claude-smart-router key set classifier`);
+      }
+    }
+
+    if (ROUTER_TOKEN) console.log(`[router] proxyAuth=enabled`);
+    else console.log(`[router] proxyAuth=disabled (set routerToken in config or ROUTER_TOKEN env to enable)`);
+
+    if (RATE_LIMIT_RPM > 0) {
+      console.log(`[router] rateLimit=${RATE_LIMIT_RPM}rpm burst=+${RATE_LIMIT_BURST} trustXff=${RATE_LIMIT_CFG?.trustXff === true}`);
+    } else {
+      console.log(`[router] rateLimit=disabled (set rateLimit.rpm in config to enable)`);
+    }
+
+    if (routesTemplate) console.log(`[router] routesTemplate=ROUTES.md (keyword mode)`);
+    else console.log(`[router] routesTemplate=built-in (JSON mode)`);
+
+    // Repo map: build eagerly so the first request doesn't pay the walk
+    // cost, and so a misconfigured root surfaces at startup instead of
+    // silently producing an empty map on turn 1.
+    if (REPO_MAP_ENABLED) {
+      const map = buildRepoMap();
+      if (map) {
+        console.log(
+          `[router] repoMap=enabled root=${REPO_MAP_ROOT} files=${repoMapFileCount} ` +
+          `bytes=${repoMapBytes} (~${Math.ceil(repoMapBytes / 4)} tokens, every request, frozen per session, min=${REPO_MAP_MIN_COMPLEXITY})`
+        );
+        console.log(`[router] repoMap: GET /map to inspect, POST /map/refresh to rebuild (new sessions only)`);
+      } else {
+        console.log(`[router] repoMap=enabled but no source files found under ${REPO_MAP_ROOT} (map will be skipped)`);
+      }
+      // Early validation of pinned files: warn now if any are missing or
+      // unreadable, so the user discovers config typos at startup instead
+      // of after sending their first message and seeing nothing injected.
+      if (REPO_MAP_PINNED_FILES.length) {
+        const pinned = readPinnedFiles();
+        const found = new Set(pinned.map((p) => p.path));
+        const missing = REPO_MAP_PINNED_FILES.filter((p) => !found.has(p));
+        if (missing.length) {
+          console.warn(`[router] repoMap: pinned file(s) not found/readable: ${missing.join(", ")}`);
+        }
+        const pinnedBytes = pinned.reduce((n, f) => n + f.bytes, 0);
+        console.log(
+          `[router] repoMap: pinnedFiles=${pinned.length}/${REPO_MAP_PINNED_FILES.length}` +
+          (pinned.length ? ` (~${Math.ceil(pinnedBytes / 4)} tokens, max ${REPO_MAP_PINNED_MAX_BYTES}B each)` : "")
+        );
+      }
+      if (REPO_MAP_WRITE_TO_FILE) {
+        console.log(`[router] repoMap: writeToFile=${REPO_MAP_WRITE_TO_FILE} (use @include in CLAUDE.md for every-turn visibility)`);
+      }
+      const thresholds = Object.entries(REPO_MAP_COMPACT_AFTER)
+        .map(([k, v]) => `${k}=${v}`)
+        .join(" ");
+      console.log(`[router] repoMap: compactAfter=${thresholds} (real user turns; tool round-trips don't count)`);
+    } else {
+      console.log(`[router] repoMap=disabled (set repoMap.enabled=true in config.json to enable)`);
+    }
+  });
+})();
 
 // A second instance on the same port is almost always a stale process —
 // give the actionable hint instead of a bare stack trace.

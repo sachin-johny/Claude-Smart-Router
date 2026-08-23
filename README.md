@@ -30,7 +30,9 @@ Anthropic Messages API — instead of you manually switching models.
    retries once on the next-smarter tier so you don't see the error.
 9. **GLM Coding Plan credit tracking**: real 5-hour and weekly plan-credit
    accounting from actual usage, peak/off-peak rates, one-time hints, and a
-   `GET /credits` dashboard (see below).
+   `GET /credits` dashboard (see below). An optional overlay can also pull
+   your **actual account usage** straight from Z.ai, closing the one blind
+   spot the router's own ledger has (traffic that bypasses the proxy).
 
 Zero npm dependencies — Node.js 18+ only (uses global `fetch`).
 
@@ -252,7 +254,12 @@ Set `ROUTER_ENV_PATH` if you want the env file somewhere other than next to
 - `GET /credits` — live GLM Coding Plan usage: 5h/weekly totals and
   percentages, the weekly reset instant, when the 5h window replenishes,
   and peak-hour state with the next change as an absolute instant (see
-  below).
+  below). Also carries `zaiAccount` when the
+  [account-usage overlay](#zai-account-usage-overlay-optional--ground-truth-from-your-account)
+  is enabled (`null` otherwise).
+- `POST /credits/refresh` — forces an immediate z.ai account-usage poll,
+  bypassing the interval. Returns the same shape as `GET /credits`. No-ops
+  with `{ enabled: false }` if `credits.zaiAccountUsage` isn't on.
 - `GET /map` — inspect the current repo map (see below).
 - `POST /map/refresh` — rebuild the repo map cache. Call after `git pull`,
   reorg, or any time the cached map has gone stale.
@@ -278,7 +285,10 @@ Set `ROUTER_ENV_PATH` if you want the env file somewhere other than next to
   local clock equivalent of the Mon–Fri 14:00–18:00 SGT window, and the
   billing rate in effect (1× in peak, 0.5× off-peak). A "Router log" card
   tails the terminal output next to it. Light and dark themes follow your
-  system, with a manual toggle.
+  system, with a manual toggle. When the [z.ai account-usage overlay](#zai-account-usage-overlay-optional--ground-truth-from-your-account)
+  is enabled, each meter shows the provider's own percentage alongside the
+  router's ledger, and a `⟳` button next to the credits header forces an
+  immediate refresh outside the normal poll interval.
 - `GET /keys` — masked view of the keystore (`route` / `classifier` /
   `router`), same format as `key list`. **Never returns plaintext** —
   defense-in-depth so a leaked dashboard token still can't exfiltrate raw
@@ -519,6 +529,52 @@ Plan's two windows:
   and the peak windows on your local clock, never Singapore's.
 - Known blind spot: traffic that bypasses the router (Z.AI MCP tools,
   direct API clients) is invisible — treat the numbers as a lower bound.
+  The overlay below closes this gap.
+
+### Z.ai account-usage overlay (optional — ground truth from your account)
+
+The router's own ledger above is computed from usage objects on responses
+that actually went *through* the router — accurate for that traffic, but
+blind to anything that didn't. This overlay polls Z.ai's account directly,
+so the numbers reflect everything billed to your key, router or not.
+
+```json
+"credits": {
+  "zaiAccountUsage": true,
+  "zaiApiKey": null,
+  "zaiAccountUsagePollMs": 25000,
+  "zaiAccountUsageTimeoutMs": 8000
+}
+```
+
+- **Off by default.** Set `zaiAccountUsage: true` to enable — it's an
+  extra outbound call on a timer, so it's opt-in rather than silent.
+- **API key resolution**: `credits.zaiApiKey` override → `ZAI_API_KEY` env
+  var → whichever configured route/classifier already points at a `z.ai`
+  baseUrl. For most setups this means no extra config — it reuses your
+  existing GLM key.
+- **Polls Z.ai's own (undocumented) monitor endpoints** —
+  `GET /api/monitor/usage/quota/limit` and `/model-usage`. No official
+  docs exist for these; the response shape was reverse-engineered against
+  a live account and could change without notice. Each `TOKENS_LIMIT`
+  entry reports a **percentage only** (no absolute used/cap), and the
+  router infers which entry is the 5-hour vs. weekly window by comparing
+  `nextResetTime` — whichever resets sooner is the shorter window.
+- **Default poll interval is 25s** (`zaiAccountUsagePollMs`, 10s floor).
+  The *first* poll runs before the server starts listening (bounded by
+  `zaiAccountUsageTimeoutMs`, default 8s), so the dashboard's very first
+  load already has real numbers instead of "not polled yet."
+- **Persists to `credits-state.json`.** Every successful poll writes
+  through immediately, and a fresh boot seeds from that file before the
+  live poll even finishes — a restart never shows a blank overlay.
+- **Manual refresh**: `POST /credits/refresh` forces an immediate poll.
+  The dashboard's credits card has a small `⟳` button next to the header
+  for this — it shows "cached · as of HH:MM" when you're looking at
+  disk-seeded data rather than a fresh live poll.
+- `GET /credits` includes the overlay under `zaiAccount` (`null` when
+  disabled). `zaiAccount.ok: false` means the last poll failed — check
+  `zaiAccount.error`, or run with `debug: true` to see the raw response
+  in the trace.
 
 ## Known limitations
 
@@ -542,273 +598,10 @@ Plan's two windows:
   judge complexity, but very context-dependent requests may be misjudged.
 - Single-process; no clustering. Fine for a personal proxy's load.
 
-## Changes in 1.6.4 (config: dashboard.debug)
+## Changelog
 
-New `"dashboard": { "debug": true }` config flag (or `DASHBOARD_DEBUG=1`
-env): capture the per-request debug trace in the dashboard's Router log
-card **without** printing it to the terminal. `debug: true` still does
-both. The boot summary notes when it's active.
-
-## Changes in 1.6.3 (dashboard: peak status card, router log tail, saner polling)
-
-The peak card was a full-width week strip at the bottom — lots of space,
-little information density. It's now a compact half-width status card
-directly under the credits meters, and the terminal itself moved into the
-dashboard next to it.
-
-- New `GET /logs` — ring buffer of the router's last 400 console lines
-  (boot summary, routing decisions, warnings, debug trace), redacted with
-  the same secret patterns as stdout. `?after=<seq>` returns only newer
-  lines. The dashboard's "Router log" card tails it every 3s, appends
-  incrementally, and sticks to the bottom unless you scroll up — what the
-  terminal shows, without the terminal.
-- Peak status card: on/off pill, "Peak ends / Next peak" with local clock
-  time + countdown, the peak window translated to your timezone
-  (e.g. `08:00–12:00 (Europe/Berlin)`), the fixed `Mon–Fri 14:00–18:00`
-  SGT window, and the billing rate in effect — 1× full rate in peak,
-  0.5× off-peak (weekday nights + weekends), per the Z.AI plan docs.
-  The week strip is gone; the card answers the same questions in a
-  fraction of the space.
-- Poll cadence matches how fast each source actually changes: health 8s,
-  credits 15s, log tail 3s. `/keys` is fetched **once** at load — the
-  keystore is read at boot and only changes on restart, so re-polling it
-  was noise.
-
-## Changes in 1.6.2 (dashboard: resets + peak hours in your timezone)
-
-The dashboard showed a bare "Weekly window" percentage with no reset
-time, and peak hours only as a countdown against Singapore's clock —
-useless for answering "when does my week refresh?" and "when is peak
-*for me*?". Both answers now render in the viewer's own timezone, and
-the dashboard got a proper visual pass (reference data-viz palette,
-light + dark themes, system font, responsive layout).
-
-- `/credits` grows instant-based fields so clients can localize:
-  `weekly.resetsAt` (already existed) now joined by
-  `fiveHour.clearsAt` (when the sliding window fully replenishes),
-  `peak.changeAt` / `peak.windowStartAt` / `peak.windowEndAt`, and
-  top-level `warnPct`. Internally `minutesUntilPeakChange()` is now
-  derived from a shared `peakWindow()` helper (current-or-next window
-  as absolute instants) — one source of truth for hints and snapshot.
-- Dashboard weekly meter shows "resets Wed, 26 Aug, 21:17 · in 4d 3h"
-  in local time; the 5h meter shows when the window clears if idle.
-- Peak card: current/off-peak state with the next change as a local
-  clock time, plus a Mon–Sun week strip placing each day's 14:00–18:00
-  SGT peak block on your local 24h lane with a now-marker — computed
-  from instants, so it stays correct across timezones, midnight-
-  straddling windows, and your own DST changes.
-- The in-conversation peak hint now appends the machine-local
-  translation of the SGT window (e.g. `14:00-18:00 UTC+8 = 08:00-12:00
-  on this machine`).
-
-## Changes in 1.6.0 (readable upstream error logs)
-
-A bare `classifier HTTP 529` in the log tells you nothing at 2am —
-you end up grepping what the status means before knowing whether to
-wait it out, rotate a key, or fix a config path. (Debugging exactly
-such a 401 while setting up a separate classifier key is what
-prompted this.)
-
-- **`httpStatusHint()`** maps the statuses upstreams actually return to
-  a plain-language cause: 401 `auth failed — key invalid, expired, or
-  wrong provider`, 403 `forbidden — key lacks access to this model`,
-  404 `not found — wrong baseUrl or model name`, 429 `rate limited —
-  quota or RPM exceeded`, 529 `overloaded — upstream at capacity`, and
-  so on; unmapped 5xx fall back to `upstream error`.
-- Wired into every failure log site — the classifier retry lines, the
-  final throw (which the `triage failed (...)` warnings echo), ollama
-  errors, and the `upstream <- HTTP ...` debug trace — so failures now
-  read e.g. `triage failed (classifier HTTP 529 (overloaded — upstream
-  at capacity)), falling back`.
-- Success logs were initially left bare here — 1.6.1 adds the gloss.
-- Test suite grows a stderr-tail capture helper and a test forcing
-  mock 529/401 classifier replies to pin the hint text (217
-  assertions, up from 213).
-
-## Changes in 1.6.1 (success lines get the gloss too)
-
-1.6.0 decorated every failure status but left the one line a healthy
-router prints on every request bare: `upstream <- HTTP 200 from
-glm-5`. Now it reads `upstream <- HTTP 200 (ok) from glm-5`, so
-success and failure lines scan the same way and a bare `HTTP 200`
-never appears in debug output.
-
-- `httpStatusHint()` grows a `200: "ok"` entry — the only success
-  status LLM upstreams actually return.
-- The test harness gains a stdout tail (debugLog writes to stdout,
-  warnings to stderr) and the hint test now runs with `DEBUG=1` to
-  pin the `200 (ok)` success line (218 assertions).
-
-## Changes in 1.5.0 (classifier resilience + compact detection)
-
-When Claude Code fires a turn, 3 concurrent requests hit the same GLM
-key (real turn + 1–2 title-gen side-channels + classifier). The key's
-per-key RPM/burst limit trips with HTTP 429, and the classifier's
-original retry loop had no jitter, ignored `Retry-After`, didn't drain
-error bodies (holding HTTP/2 stream slots), lacked single-flight and a
-circuit breaker, and its catch block hardcoded `medium`. Result:
-thundering-herd retry storms, classifier failures, and cost regression
-(0.15 → 0.40) on recovery.
-
-Fix: config-overridable knobs (all defaults safe, existing configs work
-unchanged):
-
-- **Exponential backoff with ±40% jitter** — eliminates lockstep retry
-  storms; honors `Retry-After` header up to `backoffMaxMs`.
-- **Deadline-bounded retry loop** (`deadlineMs=15000`, capped at 25% of
-  upstream timeout) — per-attempt timeout reduced from 30s to 8s.
-- **Error body drained** via `res.body?.cancel()` on `!res.ok` — releases
-  HTTP/2 stream slots.
-- **Circuit breaker** (closed → open after 3 failures, half-open probe
-  after 60s) — prevents re-flooding an already-overloaded upstream.
-- **Single-flight dedupe** (`classifyInFlight` map) — byte-identical
-  in-flight prompts share one Promise (fixes title-gen duplicate calls).
-- **Smarter fallback chain** — prior session complexity → heuristic
-  (if enabled) → `medium` (last resort). Fixes the hardcode fallback.
-- **Title-gen skip** (`titleGenSkip=on`) — regex matches `<session>…</session>`
-  and `title` keyword, routes to `super_easy` without a classifier call.
-- **Compact skip** (`compactSkip=on`) — regex matches `CRITICAL: Respond
-  with TEXT ONLY`, routes to `medium` (or `hard` for >30 messages)
-  without a classifier call. Fixes non-deterministic /compact routing.
-- **Observability** — `/health` exposes breaker state, in-flight count,
-  skip stats (`singleFlightHits`, `breakerSkips`, `titleGenSkipped`,
-  `compactSkipped`). Startup logs all knobs.
-
-New `test/run-tests.js` resilience suite (14 tests, filterable via `node
-test/run-tests.js resilience`) proves each fix.
-
-## Changes in 1.4.0 (security & robustness hardening)
-
-Applied from an external engineering + security review:
-
-- **Credit hints no longer break the prompt-cache prefix.** The 5-hour and
-  peak-hour hints are appended to the session's *last* user message (the
-  per-turn mutable tail) instead of the first, which carries the
-  byte-frozen repo-map block — previously turn 2 rewrote the cache-stable
-  prefix, so every later turn paid full input price for the map.
-- **Passthrough is allowlisted.** Only known Anthropic non-chat endpoints
-  forward to the upstream; other paths get a 404 and `..`/`\` traversal
-  attempts a 400. The proxy can no longer be steered into attaching your
-  API key to arbitrary upstream paths.
-- **Timing-safe `routerToken` comparison** (`crypto.timingSafeEqual`).
-- **Stronger session keys**: SHA-256, seeded with `metadata.user_id` when
-  present, so two users typing the same first message on one machine no
-  longer share budget/escalation/repo-map state.
-- **Per-IP rate limiting** via the new `rateLimit` config (`rpm`,
-  `burst`, `trustXff`) — off by default.
-- **Genericized upstream errors**: clients get `router: upstream call
-  failed` without the underlying `ECONNREFUSED host:port` detail; the
-  verbose error stays in the server log.
-- **Debug logs redact secrets** (`sk-ant-…`, `sk-…`, `ghp_…`, `AKIA…`,
-  `password=`/`api_key=`/`token=` assignments, `Bearer` JWTs) and log
-  request paths without query strings.
-- **Classifier prompt-injection defense**: the triage prompt treats the
-  user message as untrusted data, and classifier-returned assumptions are
-  sanitized (paths, URLs, env vars, secrets, and tool invocations are
-  dropped; capped at 200 chars and 4 items) before any clarification note
-  is appended.
-- **`credits-state.json` is written with mode `0600`**, matching the
-  keystore.
-- Smaller fixes: `structuredClone` instead of a JSON deep-clone round-trip,
-  explicit symlink skip in the repo-map walk, `.unref()`'d abort timers,
-  centralized eviction across all per-session maps (was a slow leak),
-  tightened failure-escalation patterns (long legitimate "I cannot
-  complete…" replies no longer burn a tier escalation), tightened the
-  `super_hard` keyword heuristic ("what is a design system?" no longer
-  routes to super_hard), keyword-mode clarity parsing tolerates trailing
-  punctuation, and `.env` inline `# comments` are stripped.
-- New `test/security-tests.js` regression suite (auth, passthrough,
-  session-key isolation) wired into `npm test`.
-
-## Changes in 1.3.0
-
-- Budget enforcement: `budgetMax` / `budgetReject` give the logged cost
-  weights teeth — breached sessions downgrade to the cheapest tier or get
-  rejected.
-- Auto-escalation: upstream failures and 5xx trigger one retry on the
-  next-smarter tier (capped per session).
-- GLM Coding Plan credit tracking: 5-hour sliding + weekly anchored
-  windows, peak/off-peak 0.5× accounting, one-time hints, `GET /credits`,
-  and crash-safe ledger persistence.
-- Classifier optimizations: a keyword heuristic pre-filter and a
-  classification cache, both configurable (`heuristic`,
-  `classifyCacheTtlMs`) and off-capable for testing.
-- One-time `/compact` hint after `compactHintTurns` user turns.
-- Router shutdown no longer hangs on idle keep-alive sockets
-  (`server.closeIdleConnections()`).
-
-## Changes from earlier version (fixes applied)
-
-A few correctness issues were found and fixed in this pass:
-
-1. **Stale clarification notes no longer leak into later turns.** Auto-
-   clarification now only fires on the turn that generated it — previously,
-   inheriting a routing decision on a continuation or short follow-up also
-   inherited (and re-appended) the original ambiguity note on every
-   subsequent turn of the session, including onto tool-result-only messages
-   that had nothing to do with the original ambiguity.
-2. **Tool-floor bumps no longer permanently mutate session state.**
-   The session now stores the *classified* complexity; the tool-floor bump
-   applies to routing for that turn only. Previously the bumped value was
-   what got stored, so a floor bump on one turn silently rewrote history
-   for turns after it (copying the decision object alone didn't fix this —
-   the copy was made *before* the bump was applied to it).
-3. **`/v1/messages/count_tokens` now correctly passes through** instead of
-   being misrouted as a full chat request. The passthrough check used
-   `startsWith("/v1/messages")`, which also matched the count_tokens path;
-   it now requires an exact match.
-4. **Passthrough responses strip `content-encoding`/`content-length`/
-   `transfer-encoding` headers** before forwarding — `fetch()` transparently
-   decompresses gzip/deflate bodies, so forwarding the original encoding
-   headers could make the client try to decode an already-decoded body.
-5. **`ROUTES.md`'s documented `Context: ... / Message: ...` format is now
-   actually built** for follow-ups in keyword mode — previously the router
-   only substituted `{MESSAGE}` and appended system context separately,
-   never producing the context-aware shape the template's own examples
-   describe.
-6. **Ollama classifier in JSON mode now receives the JSON schema.** The
-   Ollama branch of `callClassifier` sent only the user message to
-   `/api/generate`, silently dropping `payload.system` — where the built-in
-   JSON triage prompt keeps its format instructions. The local model
-   replied freeform, `JSON.parse` failed, and *every* request silently
-   degraded to `medium`. The system text is now flattened into the prompt.
-7. **Legacy `light`/`heavy` configs route correctly.** The old
-   `LEGACY_TIER_MAP` was looked up in the wrong direction (by complexity
-   value, though its keys were route names), so it never matched; a `hard`
-   request on a `{light, heavy}` config fell through the neighbor-chain and
-   landed on `light` — the cheap tier — for expensive work. It's now a
-   proper complexity→route mapping (`easy`→`light`, `medium`+→`heavy`).
-
-Issues #1–#5 were fixed before this pass; #6 and #7 were found by the test
-suite (`node test/run-tests.js` — credits, repo-map lifecycle, JSON mode,
-keyword mode, Ollama, fallbacks, env overrides, auth, and error paths;
-plus `node test/extra-probes.js` for gzip passthrough and concurrency).
-
-## Testing
-
-```bash
-npm test
-```
-
-This runs `test/run-tests.js` (the main e2e suite — boots the router against
-mock Anthropic- and Ollama-shaped backends and asserts on what actually got
-forwarded), then `test/security-tests.js` (security regression gate:
-timing-safe auth, the passthrough allowlist, and session-key isolation),
-then `test/extra-probes.js` (gzip header-stripping and a 20-way concurrency
-smoke test). All of them spawn `test/mock-backends.js` automatically; you
-don't run it directly.
-
-`test/latency-probe.js` is a separate, manual one-off — it hits the real
-z.ai endpoint with a live API key to compare per-tier latency and is not
-part of `npm test` or CI (it costs real request quota and needs a real key
-in `ROUTE_API_KEY`, the keystore, or `.env`):
-
-```bash
-node test/latency-probe.js glm-4.7 glm-5.2
-```
-
-CI runs the full `npm test` suite on every push and PR across Node
-20/22 — see `.github/workflows/ci.yml`.
+See [CHANGELOG.md](CHANGELOG.md) for the full version history and every
+fix/feature by release.
 
 ## License
 
