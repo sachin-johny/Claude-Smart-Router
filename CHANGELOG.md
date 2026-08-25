@@ -3,6 +3,13 @@
 All notable changes to `claude-smart-router` are documented here.
 See [README.md](README.md) for setup and usage.
 
+## 1.7.3 (Repo map byte-stability)
+
+- **Issue #**: Snapshots the `compactThreshold` numerical value at freeze time so mid-session config updates don't erroneously shrink the repo map prematurely.
+- **Issue #2**: Preserves leading whitespace for array-based map content, preventing a prompt cache break when switching from string- to array-based first messages.
+- **Issue #3**: `REPO_MAP_CODE_NOEXT` ensures extensionless files like `Makefile` and `Dockerfile` are successfully injected into the repo map and no longer skipped by the compact view.
+- **Issue #4**: Expanded testing for post-flip byte stability.
+
 ## 1.7.2 (Engineering review fixes)
 
 - **Issue #1**: Fixed keyword-mode assumption parsing casing for proper nouns by preserving original case.
