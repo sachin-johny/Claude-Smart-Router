@@ -3,6 +3,14 @@
 All notable changes to `claude-smart-router` are documented here.
 See [README.md](README.md) for setup and usage.
 
+## 1.7.2 (Engineering review fixes)
+
+- **Issue #1**: Fixed keyword-mode assumption parsing casing for proper nouns by preserving original case.
+- **Issue #2**: Removed redundant `Message:` label when replacing `{MESSAGE}` to prevent template issues.
+- **Issue #3**: Tightened design and refactor rules to use verb-anchors, preventing false positives on questions.
+- **Issue #4**: Extracted 588-line dashboard HTML string to its own `dashboard.html` file and added it to package exports.
+- **Issue #5**: Stripped `DEBUG` and `DASHBOARD_DEBUG` from parent environment when running tests to ensure isolation.
+
 ## 1.7.0 (z.ai account-usage overlay + dashboard refresh)
 
 Adds an optional overlay that reads your **actual account usage** straight
