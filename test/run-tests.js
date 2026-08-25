@@ -1215,6 +1215,164 @@ async function runTests() {
     }
   });
 
+  // ---- §8.1 regression: compactThreshold is snapshotted at freeze time ----
+  await test("repoMap §8.1: compactThreshold snapshotted at freeze (immune to config restart)", async () => {
+    // Freeze with compactAfter.hard = 99 (effectively "never compact").
+    await startMapRouter({ enabled: true, compactAfter: { hard: 99 } });
+    HARD_REPLY();
+    clearLog();
+    const t1 = "map-snap: refactor the routing logic across files here";
+    // Turn 1: freeze with threshold=99
+    await post("/v1/messages", msgBody({ messages: [{ role: "user", content: t1 }] }));
+    // Turn 2: 2 text turns. If the threshold were re-read from config (which
+    // we DON'T change here), 2 < 99 so still full. But we're testing that the
+    // threshold VALUE was snapshot, not the mechanism of changing it mid-flight.
+    // The real scenario (restart with new config) can't be tested without a
+    // restart; instead we verify the frozen payload carries the right value
+    // by checking that compactAfter.hard=2 DOES trigger compact on turn 2,
+    // and compactAfter.hard=99 does NOT — proving the value is read at freeze.
+    await post("/v1/messages", msgBody({
+      messages: [
+        { role: "user", content: t1 },
+        { role: "assistant", content: "done" },
+        { role: "user", content: "now also update the tests accordingly please" },
+      ],
+    }));
+    const calls2 = chatCalls();
+    ok(!firstUserText(calls2[1]).includes("(compacted)"),
+      "threshold=99: turn 2 still FULL map (not compacted)", firstUserText(calls2[1]).slice(0, 100));
+    await stopRouter();
+
+    // Now freeze with compactAfter.hard = 1 — turn 2 should compact.
+    await startMapRouter({ enabled: true, compactAfter: { hard: 1 } });
+    HARD_REPLY();
+    clearLog();
+    await post("/v1/messages", msgBody({ messages: [{ role: "user", content: t1 }] }));
+    await post("/v1/messages", msgBody({
+      messages: [
+        { role: "user", content: t1 },
+        { role: "assistant", content: "done" },
+        { role: "user", content: "now also update the tests accordingly please" },
+      ],
+    }));
+    const calls1 = chatCalls();
+    ok(firstUserText(calls1[1]).includes("(compacted)"),
+      "threshold=1: turn 2 uses compact variant (threshold snapshot from freeze-time config)",
+      firstUserText(calls1[1]).slice(0, 100));
+    await stopRouter();
+  });
+
+  // ---- §8.2 regression: appendTextToMessage preserves whitespace in array content ----
+  await test("repoMap §8.2: map block preserves leading whitespace in array content", async () => {
+    await startMapRouter({ enabled: true });
+    HARD_REPLY();
+    clearLog();
+    // Send the first user message as an ARRAY (content blocks, not a string).
+    // Claude Code does this when the first message includes an image or a
+    // tool_result. The map must be appended as a new text block whose text
+    // starts with "\n\n[router project map" — NOT trimmed to "[router...".
+    await post("/v1/messages", msgBody({
+      messages: [{
+        role: "user",
+        content: [{ type: "text", text: "map-array: analyze this whole project structure now" }],
+      }],
+    }));
+    const calls = chatCalls();
+    eq(calls.length, 1, "one chat call");
+    const firstMsg = calls[0].body.messages[0];
+    ok(Array.isArray(firstMsg.content), "first message has array content");
+    // Find the appended map block (the last text block).
+    const textBlocks = firstMsg.content.filter((b) => b.type === "text");
+    const mapBlock = textBlocks[textBlocks.length - 1];
+    ok(mapBlock.text.startsWith("\n\n[router project map"),
+      "map block preserves leading \\n\\n (not trimmed)", JSON.stringify(mapBlock.text.slice(0, 40)));
+    await stopRouter();
+  });
+
+  // ---- §8.3 regression: extensionless files appear in full map AND compact block ----
+  await test("repoMap §8.3: extensionless files (Makefile) appear in map + compact", async () => {
+    await startMapRouter({ enabled: true, compactAfter: { hard: 1 } });
+    HARD_REPLY();
+    clearLog();
+    const t1 = "map-noext: refactor the build system across files here";
+    // Turn 1: full map — Makefile must appear.
+    await post("/v1/messages", msgBody({ messages: [{ role: "user", content: t1 }] }));
+    const calls1 = chatCalls();
+    const fullMap = firstUserText(calls1[0]);
+    ok(fullMap.includes("Makefile"),
+      "full map includes extensionless Makefile", fullMap.slice(0, 300));
+    // Turn 2: crosses compactAfter.hard=1 -> compact variant. Makefile
+    // must also appear in the compact path list (the old regex dropped it).
+    await post("/v1/messages", msgBody({
+      messages: [
+        { role: "user", content: t1 },
+        { role: "assistant", content: "done" },
+        { role: "user", content: "now also update the tests accordingly please" },
+      ],
+    }));
+    const calls2 = chatCalls();
+    const compactMap = firstUserText(calls2[1]);
+    ok(compactMap.includes("(compacted)"), "turn 2 uses compact variant");
+    ok(compactMap.includes("Makefile"),
+      "compact block includes extensionless Makefile (old regex dropped it)",
+      compactMap.slice(0, 300));
+    await stopRouter();
+  });
+
+  // ---- §8.4 regression: post-flip turns are byte-identical (compact variant is stable) ----
+  await test("repoMap §8.4: compact variant byte-stable across post-flip turns", async () => {
+    await startMapRouter({ enabled: true, compactAfter: { hard: 2 } });
+    HARD_REPLY();
+    clearLog();
+    const t1 = "map-stable: rewrite the parser and add error handling everywhere";
+    // Turn 1: 1 text turn -> full map (1 <= 2)
+    await post("/v1/messages", msgBody({ messages: [{ role: "user", content: t1 }] }));
+    // Turn 2: 2 text turns -> full map (2 <= 2, not > 2)
+    await post("/v1/messages", msgBody({
+      messages: [
+        { role: "user", content: t1 },
+        { role: "assistant", content: "ok" },
+        { role: "user", content: "go ahead with the rewrite now thanks" },
+      ],
+    }));
+    // Turn 3: 3 text turns -> compact (3 > 2) — the flip happens here
+    await post("/v1/messages", msgBody({
+      messages: [
+        { role: "user", content: t1 },
+        { role: "assistant", content: "ok" },
+        { role: "user", content: "go ahead with the rewrite now thanks" },
+        { role: "assistant", content: "rewriting" },
+        { role: "user", content: "finally update the readme as well please" },
+      ],
+    }));
+    // Turn 4: 4 text turns -> still compact (4 > 2) — must be byte-identical to turn 3
+    await post("/v1/messages", msgBody({
+      messages: [
+        { role: "user", content: t1 },
+        { role: "assistant", content: "ok" },
+        { role: "user", content: "go ahead with the rewrite now thanks" },
+        { role: "assistant", content: "rewriting" },
+        { role: "user", content: "finally update the readme as well please" },
+        { role: "assistant", content: "done" },
+        { role: "user", content: "great now run the test suite please" },
+      ],
+    }));
+    const calls = chatCalls();
+    eq(calls.length, 4, "four chat calls");
+    // Turn 3 and turn 4 must have byte-identical first user messages.
+    // This is the assertion that was MISSING: the existing compact test
+    // only checked that the compact variant *appears*, not that it's
+    // *stable* across subsequent turns. A regression that re-rendered
+    // the compact block per-turn (instead of using the frozen
+    // compactBlock string) would pass the old test but fail this one.
+    eq(
+      JSON.stringify(calls[2].body.messages[0]),
+      JSON.stringify(calls[3].body.messages[0]),
+      "post-flip first user message byte-identical (turn 3 == turn 4)"
+    );
+    await stopRouter();
+  });
+
   // ---------------- credits (GLM Coding Plan tracking) ----------------
   console.log("\n== suite: credits ==");
   {

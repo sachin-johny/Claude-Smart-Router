@@ -2363,11 +2363,25 @@ function extractComplexityKeyword(text) {
 // on an earlier block is unaffected by blocks appended after it. Never
 // add our own cache_control — the client may already use all 4
 // breakpoints, and a 5th is a request-rejecting error.
+//
+// BYTE-STABILITY: both branches must produce byte-identical output for
+// the same `text` argument. The string branch concatenates verbatim;
+// the array branch previously called text.trim(), which silently
+// stripped leading/trailing whitespace — the map block starts with
+// "\n\n" and the trim turned it into "[router project map...", making
+// the array path render DIFFERENTLY from the string path for the same
+// payload. That was an invisible inconsistency: within a single session
+// the message format is stable (so cache-stability held), but a session
+// whose first user message used array content paid a different cache
+// prefix than one whose first message was a string. Removing the trim
+// makes both paths identical. For existing sessions using array content
+// this is one cache break (same trade-off as the compact flip), then
+// stable.
 function appendTextToMessage(msg, text) {
   if (typeof msg.content === "string") {
     msg.content = msg.content + text;
   } else if (Array.isArray(msg.content)) {
-    msg.content = [...msg.content, { type: "text", text: text.trim() }];
+    msg.content = [...msg.content, { type: "text", text }];
   }
 }
 
@@ -2447,6 +2461,17 @@ const REPO_MAP_CODE_EXT = new Set([
   ".py", ".go", ".rs", ".java", ".kt", ".rb", ".php",
   ".sh", ".bash", ".zsh",
 ]);
+// Extensionless files that are still part of the codebase surface area.
+// These are build/config files that a developer would want the model to
+// know about (Makefile, Dockerfile, etc.) but have no dot-extension. The
+// map builder checks this set when the extension lookup fails.
+const REPO_MAP_CODE_NOEXT = new Set([
+  "Makefile", "makefile", "GNUmakefile",
+  "Dockerfile", "Containerfile",
+  "Jenkinsfile", "Justfile", "justfile",
+  "Rakefile", "Gemfile", "Vagrantfile",
+  "WORKSPACE", "BUILD",
+]);
 const REPO_MAP_MAX_EXPORTS = 8;
 const REPO_MAP_MAX_PATH_LEN = 96;
 const REPO_MAP_MAX_DEPTH = 8;
@@ -2499,7 +2524,10 @@ function buildRepoMap() {
         walk(full, depth + 1);
       } else if (ent.isFile()) {
         const ext = path.extname(ent.name).toLowerCase();
-        if (!REPO_MAP_CODE_EXT.has(ext)) continue;
+        // Accept files with a known code extension OR known extensionless
+        // build/config filenames (Makefile, Dockerfile, etc.). The latter
+        // have ext="" which would otherwise be skipped.
+        if (!REPO_MAP_CODE_EXT.has(ext) && !REPO_MAP_CODE_NOEXT.has(ent.name)) continue;
         if (rel.length > REPO_MAP_MAX_PATH_LEN) continue;
         const exports = extractExports(full, ext);
         // Indent paths by depth so the tree is skimmable.
@@ -2712,9 +2740,13 @@ function buildCompactBlockText(mapText) {
   const filePaths = [];
   for (const line of mapText.split("\n")) {
     if (line.startsWith("Project map")) continue;
-    // path-like token containing an extension, optionally followed by
-    // "  ->  export, names"
-    const m = line.match(/^\s*([^\[\n]+?\.[a-zA-Z0-9]+)\s*(?:->|$)/);
+    // Match any path-like token up to "  ->  " (exports separator) or
+    // end of line. The old regex required a file extension
+    // (\.[a-zA-Z0-9]+), which silently dropped extensionless files
+    // like Makefile, Dockerfile, Rakefile — exactly the files the map
+    // builder now includes via REPO_MAP_CODE_NOEXT. The non-greedy
+    // (.+?) captures the path portion before the first "  ->  " or EOL.
+    const m = line.match(/^\s*(.+?)\s*(?:->|$)/);
     if (m) filePaths.push(m[1].trim());
   }
   const shown = filePaths.slice(0, 15);
@@ -3313,7 +3345,14 @@ const server = http.createServer(async (req, res) => {
         mapBlock: buildRepoMapBlock(mapText),
         compactBlock: buildCompactBlockText(mapText),
         pinnedBlock: internPinnedBlock(pinned),
-        compactTier: classifiedComplexity,
+        // SNAPSHOT the threshold VALUE at freeze time, not just the tier
+        // name. REPO_MAP_COMPACT_AFTER is read from config at module load;
+        // if the operator edits config.json and restarts mid-session, the
+        // new table would apply to existing sessions — a session frozen
+        // under hard:5 might suddenly see hard:2 and flip to compact early.
+        // Snapshotting the actual number makes the threshold immune to
+        // config changes for the lifetime of this session.
+        compactThreshold: REPO_MAP_COMPACT_AFTER[classifiedComplexity] || 0,
       };
       const injectedChars = repoMapPayload.mapBlock.length + repoMapPayload.pinnedBlock.length;
       // Multiple user turns but no session entry = the entry was evicted
@@ -3349,7 +3388,7 @@ const server = http.createServer(async (req, res) => {
   // rewrites the prefix exactly once, then the compact bytes are just
   // as stable. Pinned files are never compacted.
   if (repoMapPayload && repoMapFirstIdx >= 0) {
-    const threshold = REPO_MAP_COMPACT_AFTER[repoMapPayload.compactTier];
+    const threshold = repoMapPayload.compactThreshold;
     const useCompact = threshold && countUserTextTurns(body.messages) > threshold;
     const block = (useCompact ? repoMapPayload.compactBlock : repoMapPayload.mapBlock) +
       repoMapPayload.pinnedBlock;
