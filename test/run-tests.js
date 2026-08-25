@@ -111,9 +111,17 @@ async function startRouter(configFile, env = {}) {
   // stopping it leaves a process holding the port, and this spawn dies
   // on EADDRINUSE. stopRouter is hoisted, so this is safe to call here.
   await stopRouter();
+  // Strip DEBUG / DASHBOARD_DEBUG from the inherited env so a parent
+  // shell's `DEBUG=1 npm test` can't leak into the spawned router and
+  // break the "dashboard.debug mirrors to /logs but not stdout" test
+  // (which asserts that stdout stays quiet when only dashboard.debug
+  // is on). Tests that want to exercise debug behavior pass DEBUG /
+  // DASHBOARD_DEBUG explicitly via the `env` parameter, which overrides
+  // these undefined values below.
+  const { DEBUG: _dropDebug, DASHBOARD_DEBUG: _dropDashDebug, ...cleanEnv } = process.env;
   routerProc = spawn(process.execPath, [path.join(ROOT, "router.js")], {
     env: {
-      ...process.env,
+      ...cleanEnv,
       ROUTER_CONFIG: configFile,
       ROUTES_PATH: env.ROUTES_PATH !== undefined ? env.ROUTES_PATH : path.join(ROOT, "ROUTES.md"),
       // Isolate from any ambient .env (repo root or cwd) — tests that
@@ -2381,6 +2389,161 @@ async function runTests() {
     // so a future refactor doesn't silently remove it.
     ok(routerStdout().includes("[router] dashboard:"), "startup stdout includes dashboard URL line");
     ok(routerStdout().includes("/dashboard"), "startup stdout includes the /dashboard path");
+  });
+
+  await stopRouter();
+
+  // ---------------- regression tests for the 5-issue fix batch ----------------
+  console.log("\n== suite: 5-issue fix regressions ==");
+
+  // Fix #1: keyword-mode assumptions preserve original casing.
+  // The old code lowercased the entire classifier reply before parsing
+  // assumptions, turning "Using JavaScript" into "using javascript".
+  // JSON mode never had this bug; keyword mode now matches.
+  await test("fix#1: keyword-mode assumptions preserve original casing", async () => {
+    await startRouter(CFG_JSON);
+    clearLog();
+    // Reply in keyword format with mixed-case assumption text.
+    setReply("keyword:medium|ambiguous\nAssumptions: Using JavaScript as the language; Targeting Node 18 LTS; Assume ESM modules");
+    await post("/v1/messages", msgBody({
+      messages: [{ role: "user", content: "Write a sort function" }],
+    }));
+    const calls = chatCalls();
+    eq(calls.length, 1, "one chat call");
+    const userMsg = JSON.stringify(calls[0].body.messages[0]);
+    // The safe assumptions must be preserved WITH their original casing.
+    ok(userMsg.includes("Using JavaScript as the language"),
+      "mixed-case assumption preserved verbatim (not lowercased)", userMsg);
+    ok(userMsg.includes("Node 18 LTS"),
+      "proper-noun assumption preserved verbatim", userMsg);
+    ok(userMsg.includes("ESM modules"),
+      "acronym assumption preserved verbatim", userMsg);
+    await stopRouter();
+  });
+
+  // Fix #2: ROUTES.md's `Message: {MESSAGE}` line no longer leaves a
+  // stray `Message:` label OUTSIDE the  wrapper.
+  // The wrapper itself carries the `Message:` label (when context
+  // exists) or the bare message (when not), so the outer label is
+  // redundant and dislocated. The router now strips it before
+  // substitution.
+  await test("fix#2: no stray 'Message:' label outside the  wrapper", async () => {
+    await startRouter(CFG_JSON);
+    clearLog();
+    setReply("keyword:medium|clear");
+    await post("/v1/messages", msgBody({
+      messages: [{ role: "user", content: "Write a sort function" }],
+    }));
+    const content = String(classifierCalls()[0].body.messages[0].content);
+    // The wrapper must be present.
+    ok(content.includes("<user_message_to_classify>"),
+      " wrapper present");
+    // The wrapper must NOT be preceded by a stray `Message: ` label
+    // on the same line — that label is dislocated from the actual
+    // message text. The regex anchors on the literal text right
+    // before the wrapper open tag.
+    ok(!/Message:\s*<user_message_to_classify>/.test(content),
+      "no 'Message: ' label immediately before wrapper", content.slice(0, 200));
+    // The wrapper's own content still starts cleanly with the user
+    // message (no context = bare message; with context = Context/Message block).
+    ok(content.includes("Write a sort function"),
+      "user message text present inside wrapper");
+    await stopRouter();
+  });
+
+  // Fix #3: ROUTES.md's `design`/`refactor` rules are now verb-anchored
+  // so a question like "What is a design system?" doesn't get
+  // misrouted to super_hard when the heuristic is disabled.
+  // The classifier mock returns whatever we tell it to, so we can't
+  // test the model's interpretation directly — but we CAN assert that
+  // the prompt the router builds contains the tightened rule text
+  // (so a future ROUTES.md edit can't silently regress it).
+  await test("fix#3: ROUTES.md design/refactor rules are verb-anchored in prompt", async () => {
+    await startRouter(CFG_JSON);
+    clearLog();
+    setReply("keyword:medium|clear");
+    await post("/v1/messages", msgBody({
+      messages: [{ role: "user", content: "Write a sort function" }],
+    }));
+    const content = String(classifierCalls()[0].body.messages[0].content);
+    // The new rule explicitly distinguishes verb-form (super_hard)
+    // from question-form (easy). The old rule was just `"design" = super_hard`.
+    ok(/design a system\/architecture.*verb \+ object.*super_hard.*what is a design system.*question.*easy/i.test(content),
+      "design rule is verb-anchored (distinguishes verb-form from question-form)", content.slice(0, 800));
+    ok(/refactor the X.*verb \+ object.*hard.*what is refactor.*question.*easy/i.test(content),
+      "refactor rule is verb-anchored", content.slice(0, 800));
+    // The "What is a design system?" example is now in the examples list.
+    ok(content.includes('"What is a design system?" -> easy|clear'),
+      "'What is a design system?' example present in prompt");
+    await stopRouter();
+  });
+
+  // Fix #4: dashboard.html is loaded from disk, not inlined in router.js.
+  // The dashboard endpoint must still return the same self-contained
+  // HTML, and the file must be a separate artifact in the repo.
+  await test("fix#4: dashboard.html is a separate file loaded at startup", async () => {
+    // The file exists on disk next to router.js.
+    const dashboardPath = path.join(ROOT, "dashboard.html");
+    ok(fs.existsSync(dashboardPath), "dashboard.html exists on disk");
+    const stat = fs.statSync(dashboardPath);
+    ok(stat.size > 1000, "dashboard.html is non-trivial (>1KB)", `size=${stat.size}`);
+    // router.js no longer contains the inline `<!doctype html>` literal
+    // (it loads from disk instead).
+    const routerSrc = fs.readFileSync(path.join(ROOT, "router.js"), "utf8");
+    ok(!routerSrc.includes("const DASHBOARD_HTML = `<!doctype html>"),
+      "router.js no longer inlines the dashboard HTML");
+    ok(routerSrc.includes('readFileSync(path.join(__dirname, "dashboard.html")'),
+      "router.js loads dashboard.html via readFileSync");
+    // The /dashboard endpoint still serves the HTML end-to-end.
+    await startRouter(CFG_JSON, { ROUTES_PATH: NO_ROUTES });
+    const res = await fetch(`http://localhost:${ROUTER_PORT}/dashboard`);
+    eq(res.status, 200, "GET /dashboard returns 200");
+    const html = await res.text();
+    ok(html.includes("<!doctype html>"), "served HTML has doctype");
+    ok(html.includes("claude-smart-router"), "served HTML has the title");
+    await stopRouter();
+  });
+
+  // Fix #5: `DEBUG=1 npm test` no longer leaks into the spawned router.
+  // The "dashboard.debug mirrors to /logs but not stdout" test asserts
+  // stdout stays quiet when only dashboard.debug is on — but if the
+  // parent shell has DEBUG=1 set, the spawn inherits it via process.env,
+  // the router sees DEBUG=true, and stdout stops being quiet.
+  // The fix strips DEBUG/DASHBOARD_DEBUG from the inherited env.
+  await test("fix#5: parent-shell DEBUG=1 does not leak into spawned router", async () => {
+    // Simulate a parent shell that has DEBUG=1 set. We mutate the
+    // test runner's own process.env.DEBUG — this is exactly what
+    // `DEBUG=1 npm test` does to the runner's env. The fix in
+    // startRouter() strips DEBUG from the spawn env, so the spawned
+    // router should NOT see it.
+    const savedDebug = process.env.DEBUG;
+    process.env.DEBUG = "1";
+    try {
+      const cfg = buildConfig();
+      cfg.dashboard = { debug: true };
+      const p = path.join(LOG_DIR, "config-fix5.json");
+      fs.writeFileSync(p, JSON.stringify(cfg, null, 2));
+      await stopRouter();
+      clearRouterStdout();
+      // NOTE: we do NOT pass DEBUG via the `env` arg — that would
+      // override the strip. We set it on process.env (the parent
+      // shell), which is what the fix is supposed to clean.
+      await startRouter(p, { ROUTES_PATH: NO_ROUTES });
+      await fetch(`http://localhost:${ROUTER_PORT}/`);
+      const j = await (await fetch(`http://localhost:${ROUTER_PORT}/logs`)).json();
+      ok(j.lines.some((l) => (l.text || "").includes("[router:debug]")),
+        "per-request trace captured in the /logs ring (dashboard.debug is on)");
+      // This is the assertion that fails WITHOUT the fix: stdout would
+      // contain [router:debug] lines because DEBUG=1 leaked through
+      // process.env into the spawned router.
+      ok(!routerStdout().includes("[router:debug]"),
+        "terminal stdout stays quiet even when parent shell has DEBUG=1");
+    } finally {
+      // Restore so we don't poison later tests (or the runner itself).
+      if (savedDebug === undefined) delete process.env.DEBUG;
+      else process.env.DEBUG = savedDebug;
+    }
+    await stopRouter();
   });
 
   await stopRouter();

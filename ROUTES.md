@@ -12,13 +12,15 @@ medium: write code, function, email, research, fix bug, any code generation
 hard: refactor, debug crash, multi-file change, complex code, image analysis
 super_hard: design system, design architecture, distributed, prove, autonomous, algorithms
 
-RULE: "design" = super_hard, "refactor" = hard
+RULE: "design a system/architecture" (verb + object) = super_hard; "what is a design system?" (question) = easy
+RULE: "refactor the X" (verb + object) = hard; "what is refactor?" (question) = easy
 RULE: short message + complex context = use context complexity
 RULE: only mark ambiguous if it would genuinely change the work approach
 
 Examples:
 "Hey" -> super_easy|clear
 "What is 2+2?" -> easy|clear
+"What is a design system?" -> easy|clear
 "Write a sort function" -> medium|clear
 "Send email to Bob" -> medium|ambiguous
 "Refactor the auth module" -> hard|clear

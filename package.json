@@ -8,6 +8,7 @@
   },
   "files": [
     "router.js",
+    "dashboard.html",
     "ROUTES.md",
     "README.md",
     "config.example.json",
