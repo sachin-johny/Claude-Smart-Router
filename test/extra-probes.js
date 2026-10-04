@@ -49,7 +49,7 @@ async function main() {
   fs.writeFileSync(cfgPath, JSON.stringify(cfg));
 
   routerProc = spawn(process.execPath, [path.join(ROOT, "router.js")], {
-    env: { ...process.env, ROUTER_CONFIG: cfgPath, ROUTES_PATH: path.join(LOG_DIR, "none.md"), ROUTER_ENV_PATH: path.join(LOG_DIR, "no-env-file"), PORT: "9878" },
+    env: { ...process.env, ROUTER_CONFIG: cfgPath, ROUTES_PATH: path.join(LOG_DIR, "none.md"), ROUTER_ENV_PATH: path.join(LOG_DIR, "no-env-file"), PORT: "9878", ROUTER_ALLOW_NO_AUTH: "1" },
     stdio: ["ignore", "pipe", "pipe"],
   });
   await new Promise((r) => {
@@ -98,7 +98,7 @@ async function main() {
   routerProc.kill("SIGTERM");
   await new Promise((r) => setTimeout(r, 300));
   routerProc = spawn(process.execPath, [path.join(ROOT, "router.js")], {
-    env: { ...process.env, ROUTER_CONFIG: cfgPath2, ROUTES_PATH: path.join(LOG_DIR, "none.md"), ROUTER_ENV_PATH: path.join(LOG_DIR, "no-env-file"), PORT: "9878" },
+    env: { ...process.env, ROUTER_CONFIG: cfgPath2, ROUTES_PATH: path.join(LOG_DIR, "none.md"), ROUTER_ENV_PATH: path.join(LOG_DIR, "no-env-file"), PORT: "9878", ROUTER_ALLOW_NO_AUTH: "1" },
     stdio: "ignore",
   });
   await new Promise((r) => setTimeout(r, 800));

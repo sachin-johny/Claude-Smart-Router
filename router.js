@@ -54,6 +54,13 @@ const KEY_NAMES = ["route", "classifier", "router"];
 
 function readKeystore() {
   try {
+    // SECURITY (M4): warn if another local user could read the keystore.
+    if (process.platform !== "win32") {
+      const mode = fs.statSync(KEYSTORE_PATH).mode & 0o077;
+      if (mode) {
+        try { fs.chmodSync(KEYSTORE_PATH, 0o600); } catch (_) { /* best effort */ }
+      }
+    }
     return JSON.parse(fs.readFileSync(KEYSTORE_PATH, "utf8")) || {};
   } catch (_) {
     return {};
@@ -61,12 +68,24 @@ function readKeystore() {
 }
 
 function writeKeystore(keys) {
-  fs.mkdirSync(KEYSTORE_DIR, { recursive: true });
+  // SECURITY (M4): directory 0700 and file 0600, re-applied on EVERY write
+  // (the mode option of writeFileSync only applies when the file is first
+  // created, so a pre-existing world-readable file stayed that way).
+  fs.mkdirSync(KEYSTORE_DIR, { recursive: true, mode: 0o700 });
   fs.writeFileSync(KEYSTORE_PATH, JSON.stringify(keys, null, 2) + "\n", {
     mode: 0o600,
     flag: "w",
   });
+  if (process.platform !== "win32") {
+    try { fs.chmodSync(KEYSTORE_DIR, 0o700); } catch (_) {}
+    try { fs.chmodSync(KEYSTORE_PATH, 0o600); } catch (_) {}
+  }
+  // Windows ignores POSIX modes; the file inherits the ACL of your profile
+  // folder (readable by you, SYSTEM and admins) - acceptable, but note it.
 }
+
+// `key show router` prints the proxy token so it can be copied into
+// ANTHROPIC_AUTH_TOKEN. Other keys are never printed in full.
 
 // Prompt on the TTY (not the piped stdout) so the typed key never ends
 // up in captured output. Characters aren't echoed — this is a plain
@@ -140,6 +159,15 @@ function cmdKey(args) {
     });
     return true;
   }
+  if (sub === "show") {
+    const keys = readKeystore();
+    if (args[1] !== "router" || !keys.router) {
+      console.error("Usage: claude-smart-router key show router   (only the proxy token can be shown)");
+      process.exit(1);
+    }
+    process.stdout.write(keys.router + "\n");
+    process.exit(0);
+  }
   if (sub === "list") {
     const keys = readKeystore();
     console.log(`Keystore: ${KEYSTORE_PATH}`);
@@ -187,7 +215,7 @@ if (argv[0] === "--help" || argv[0] === "-h") {
     `                                 store an API key in ~/.claude-smart-router/ (typed blind)\n` +
     `  claude-smart-router key list   show stored keys (masked)\n` +
     `  claude-smart-router key remove <name>\n\n` +
-    `Config lookup: ./config.json, then next to the installed router.js.\n` +
+    `Config lookup: ROUTER_CONFIG, ~/.claude-smart-router/config.json, then next to router.js (cwd is NOT searched).\n` +
     `Key lookup: env vars > keystore > .env\n` +
     `Docs: README.md`
   );
@@ -202,10 +230,19 @@ if (argv[0] === "--help" || argv[0] === "-h") {
 // ROUTES_PATH) always win and skip the search.
 // ---------------------------------------------------------------
 
+// SECURITY (H1): the current working directory is NOT searched by default.
+// Starting the router inside a cloned/untrusted repo used to pick up that
+// repo's config.json (attacker-controlled baseUrl + your API key) or .env.
+// Lookup order is now: explicit env var > ~/.claude-smart-router/<file> >
+// next to router.js. Opt back in with ROUTER_ALLOW_CWD_CONFIG=1.
 function resolveFile(explicit, basename) {
   if (explicit) return explicit;
-  const cwdPath = path.join(process.cwd(), basename);
-  if (fs.existsSync(cwdPath)) return cwdPath;
+  if (process.env.ROUTER_ALLOW_CWD_CONFIG === "1") {
+    const cwdPath = path.join(process.cwd(), basename);
+    if (fs.existsSync(cwdPath)) return cwdPath;
+  }
+  const homePath = path.join(KEYSTORE_DIR, basename);
+  if (fs.existsSync(homePath)) return homePath;
   return path.join(__dirname, basename);
 }
 
@@ -411,11 +448,21 @@ const SECRET_PATTERNS = [
   /\btoken\s*[:=]\s*\S+/gi,                   // token=foo
   /\bsecret\s*[:=]\s*\S+/gi,                  // secret=foo
   /\bbearer\s+[A-Za-z0-9._-]{10,}/gi,        // Bearer <jwt-ish>
+  /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/g, // JWT
+  /\b[0-9a-f]{32}\.[A-Za-z0-9]{12,}/g,         // z.ai / GLM style key id.secret
+  /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)/g,
 ];
+// SECURITY (M7): in addition to patterns, the router redacts the EXACT
+// secret values it holds (route keys, classifier key, proxy token), so a
+// key in an unusual format can never reach the terminal ring / /logs.
+const KNOWN_SECRETS = [];
 function redactForLog(v) {
   if (typeof v !== "string") return v;
   let s = v;
   for (const re of SECRET_PATTERNS) s = s.replace(re, "[REDACTED]");
+  for (const secret of KNOWN_SECRETS) {
+    if (s.includes(secret)) s = s.split(secret).join("[REDACTED]");
+  }
   return s;
 }
 function debugLog(...args) {
@@ -466,7 +513,34 @@ for (const level of ["log", "warn", "error"]) {
 
 // Optional proxy auth: if routerToken is set in config, all requests
 // must include Authorization: Bearer <token> matching it.
-const ROUTER_TOKEN = process.env.ROUTER_TOKEN || config.routerToken || null;
+// SECURITY (H2): a token is now REQUIRED by default. If none is configured
+// (env ROUTER_TOKEN, keystore, or config.routerToken) a random 256-bit one is
+// generated and stored in the keystore on first start. Any process or web
+// page that can reach 127.0.0.1:PORT could otherwise spend your credits.
+// Escape hatch for tests/CI only: ROUTER_ALLOW_NO_AUTH=1 or allowNoAuth:true.
+const ALLOW_NO_AUTH = process.env.ROUTER_ALLOW_NO_AUTH === "1" || config.allowNoAuth === true;
+let ROUTER_TOKEN = process.env.ROUTER_TOKEN || config.routerToken || null;
+let GENERATED_TOKEN = false;
+if (!ROUTER_TOKEN && !ALLOW_NO_AUTH) {
+  ROUTER_TOKEN = crypto.randomBytes(32).toString("base64url");
+  GENERATED_TOKEN = true;
+  try {
+    const ks = readKeystore();
+    ks.router = ROUTER_TOKEN;
+    writeKeystore(ks);
+  } catch (e) {
+    console.warn(`[router] could not persist generated token (${e.message}) - it is valid for this run only`);
+  }
+}
+
+// Host / Origin allowlists (H2): defeat DNS-rebinding and cross-site requests.
+const LOOPBACK_HOSTNAMES = new Set(["127.0.0.1", "localhost", "[::1]", "::1"]);
+const ALLOWED_HOSTS = new Set([
+  ...LOOPBACK_HOSTNAMES,
+  ...(Array.isArray(config.allowedHosts) ? config.allowedHosts : []).map((h) => String(h).toLowerCase()),
+]);
+if (HOST && !["0.0.0.0", "::"].includes(HOST)) ALLOWED_HOSTS.add(String(HOST).toLowerCase());
+const ALLOWED_ORIGINS = new Set(Array.isArray(config.allowedOrigins) ? config.allowedOrigins : []);
 
 // Dashboard auto-open: when true, the router calls openBrowser() once
 // the server is listening. Off by default — auto-opening a browser from
@@ -995,7 +1069,6 @@ function checkCreditThresholds(now = Date.now()) {
 // not a correctness requirement.
 function maybeInjectCreditHints(key, lastUserIdx, firstUserIdx, messages) {
   if (!CREDITS_ENABLED || !CREDITS_HINTS || lastUserIdx < 0) return;
-  if (lastUserIdx === firstUserIdx) return; // defer — would break byte-identity
   const done = sessionCreditHints.get(key) || new Set();
   sessionCreditHints.set(key, done);
   const snap = creditsSnapshot();
@@ -1025,9 +1098,12 @@ function maybeInjectCreditHints(key, lastUserIdx, firstUserIdx, messages) {
     done.add("peak");
   }
 
+  // SECURITY / UX (H3): this used to be appended to the user's message, so the
+  // model saw router text as if YOU had typed it (and echoed it back). It is
+  // now an out-of-band notice: terminal + dashboard "Router log" only. The
+  // prompt is never modified by credit hints.
   if (hint) {
-    appendTextToMessage(messages[lastUserIdx], "\n\n" + hint);
-    debugLog(`credits: injected ${[...done].pop()} hint into session ${key.slice(0, 10)} (last user msg #${lastUserIdx})`);
+    console.log(`[router] notice (session ${key.slice(0, 8)}): ${hint.replace(/^\[router: ?/, "").replace(/\]$/, "")}`);
   }
 }
 const sessionCreditHints = registerSessionMap(new Map(), "sessionCreditHints"); // sessionKey -> Set(hint kinds already sent)
@@ -1369,6 +1445,57 @@ async function pollZaiAccountUsage() {
     const envVar = `ROUTE_${routeName.toUpperCase()}_API_KEY`;
     if (process.env[envVar]) routeCfg.apiKey = process.env[envVar];
   }
+})();
+
+// SECURITY (H1/H4): upstream destinations are validated at startup. Your API
+// key is attached to every request sent to these URLs, so a config that
+// points them at an unexpected host would hand over the key. Rules: https
+// only (plain http solely for loopback/Ollama), no embedded credentials, and
+// the host must be in allowedUpstreamHosts (default: api.z.ai,
+// api.anthropic.com) or be loopback.
+(function validateUpstreams() {
+  if (process.env.ROUTER_ALLOW_ANY_UPSTREAM === "1" || config.allowAnyUpstream === true) {
+    console.warn("[router] WARNING: upstream host allowlist DISABLED (allowAnyUpstream)");
+    return;
+  }
+  const allow = new Set(
+    ["api.z.ai", "api.anthropic.com", ...(Array.isArray(config.allowedUpstreamHosts) ? config.allowedUpstreamHosts : [])]
+      .map((h) => String(h).toLowerCase())
+  );
+  const targets = [
+    ...Object.entries(config.routes || {}).map(([n, r]) => [`routes.${n}`, r.baseUrl]),
+    ["classifier", config.classifier && config.classifier.baseUrl],
+  ];
+  const problems = [];
+  for (const [label, raw] of targets) {
+    let u;
+    try { u = new URL(String(raw)); } catch (_) { problems.push(`${label}: invalid baseUrl ${JSON.stringify(raw)}`); continue; }
+    const host = u.hostname.toLowerCase();
+    const loop = LOOPBACK_HOSTNAMES.has(host);
+    if (u.username || u.password) problems.push(`${label}: credentials in URL are not allowed`);
+    if (u.protocol !== "https:" && !(u.protocol === "http:" && loop)) {
+      problems.push(`${label}: ${u.protocol}//${host} must use https (plain http only for localhost)`);
+    } else if (!loop && !allow.has(host)) {
+      problems.push(`${label}: host "${host}" is not in allowedUpstreamHosts`);
+    }
+  }
+  if (problems.length) {
+    console.error("\n[router] Refusing to start - unsafe upstream configuration:");
+    for (const p of problems) console.error(`[router]   - ${p}`);
+    console.error('[router] If intended, add the host to "allowedUpstreamHosts" in config.json.\n');
+    process.exit(1);
+  }
+})();
+
+(function registerKnownSecrets() {
+  const add = (v) => { if (typeof v === "string" && v.length >= 12 && !KNOWN_SECRETS.includes(v)) KNOWN_SECRETS.push(v); };
+  for (const r of Object.values(config.routes || {})) add(r.apiKey);
+  if (config.classifier) add(config.classifier.apiKey);
+  add(ROUTER_TOKEN);
+  add(CREDITS_CFG.zaiApiKey);
+  add(process.env.ZAI_API_KEY);
+  add(process.env.ROUTE_API_KEY);
+  add(process.env.CLASSIFIER_API_KEY);
 })();
 
 // Z.ai account-usage polling: interval registered here (after env
@@ -2428,14 +2555,15 @@ function appendClarificationNote(messages, userIndex, assumptions) {
     debugLog(`clarify: all ${assumptions.length} assumption(s) rejected by sanitizer`);
     return;
   }
-  debugLog(`clarify: appending ${safe.length}/${assumptions.length} assumption(s) to user message #${userIndex} (after sanitize)`);
-  const note =
-    "\n\n[router auto-clarification — your request looked underspecified, " +
-    "proceeding with these assumptions unless you say otherwise:\n" +
-    safe.map((a) => `- ${a}`).join("\n") +
-    "]";
-
-  appendTextToMessage(messages[userIndex], note);
+  // SECURITY (H3): classifier output is derived from untrusted text and used
+  // to be appended to YOUR message, where the model treated it as your own
+  // instruction. A keyword denylist cannot make that safe (see
+  // test/hardening-tests.js for bypasses), so assumptions are now shown to the
+  // operator only and are NEVER forwarded to the model.
+  console.log(
+    `[router] clarify (shown here only, not sent to the model): ` +
+    safe.map((x) => JSON.stringify(x)).join("; ")
+  );
 }
 
 // ---------------------------------------------------------------
@@ -2532,9 +2660,14 @@ function buildRepoMap() {
         const exports = extractExports(full, ext);
         // Indent paths by depth so the tree is skimmable.
         const indent = "  ".repeat(Math.min(depth, 4));
+        // SECURITY (M2): file names come from the repo (possibly untrusted)
+        // and land inside the prompt. Reduce them to a safe charset so a file
+        // named "x] IGNORE PREVIOUS ... [" cannot forge text or break out of
+        // the map block.
+        const safeRel = rel.split(path.sep).join("/").replace(/[^\w.\/@+\-]/g, "?");
         const line = exports.length
-          ? `${indent}${rel}  ->  ${exports.join(", ")}`
-          : `${indent}${rel}`;
+          ? `${indent}${safeRel}  ->  ${exports.join(", ")}`
+          : `${indent}${safeRel}`;
         lines.push(line);
         repoMapBytes += line.length + 1;
         repoMapFileCount++;
@@ -2553,7 +2686,7 @@ function buildRepoMap() {
 
   // If the byte budget cut the walk short, SAY SO — otherwise the model
   // reads an alphabetically-truncated tree as the complete project.
-  const header = `Project map (root: ${path.basename(root) || root}, ${repoMapFileCount} files` +
+  const header = `Project map (root: ${(path.basename(root) || "project").replace(/[^\w.@+\-]/g, "?")}, ${repoMapFileCount} files` +
     (budgetHit ? " — TRUNCATED, more files not shown (maxTokens budget)" : "") + "):";
   repoMapCache = `${header}\n${lines.join("\n")}`;
   repoMapBytes = repoMapCache.length;
@@ -2668,6 +2801,14 @@ function readPinnedFiles() {
       continue;
     }
     try {
+      // SECURITY (M2): a symlink inside the project must not smuggle in a
+      // file from outside it - compare REAL paths.
+      const realFull = fs.realpathSync(full);
+      const realRoot = fs.realpathSync(root);
+      if (realFull !== realRoot && !realFull.startsWith(realRoot + path.sep)) {
+        console.warn(`[router] repoMap: pinned file resolves outside root (symlink?): ${rel}`);
+        continue;
+      }
       const stat = fs.statSync(full);
       if (!stat.isFile()) continue;
       const fd = fs.openSync(full, "r");
@@ -2818,20 +2959,98 @@ function checkRateLimit(req) {
   return { allowed: true };
 }
 
-function checkAuth(req) {
-  if (!ROUTER_TOKEN) return true; // auth not configured
+// Constant-time compare on SHA-256 digests: equal length by construction, so
+// neither the bytes NOR the length of the real token leak through timing.
+function sha256(v) { return crypto.createHash("sha256").update(String(v)).digest(); }
+function tokenMatches(candidate) {
+  if (!candidate || !ROUTER_TOKEN) return false;
+  return crypto.timingSafeEqual(sha256(candidate), sha256(ROUTER_TOKEN));
+}
+
+// Dashboard login (browsers can't attach a Bearer header to a page load).
+// Startup prints a ONE-TIME code URL; visiting it swaps the code for an
+// HttpOnly + SameSite=Strict session cookie. Cookie sessions are accepted
+// only for dashboard/read endpoints, never for /v1/* (least privilege).
+const dashCodes = new Map();    // one-time code -> expiry ms
+const dashSessions = new Map(); // session id -> expiry ms
+function mintDashboardCode() {
+  const code = crypto.randomBytes(18).toString("base64url");
+  dashCodes.set(code, Date.now() + 120_000);
+  return code;
+}
+function parseCookies(h) {
+  const out = {};
+  for (const part of String(h || "").split(";")) {
+    const i = part.indexOf("=");
+    if (i > 0) out[part.slice(0, i).trim()] = part.slice(i + 1).trim();
+  }
+  return out;
+}
+function hasDashSession(req) {
+  const sid = parseCookies(req.headers.cookie).rsid;
+  const exp = sid && dashSessions.get(sid);
+  if (!exp) return false;
+  if (exp < Date.now()) { dashSessions.delete(sid); return false; }
+  return true;
+}
+function tryDashboardLogin(req, res, pathname) {
+  if (!(req.method === "GET" && pathname === "/dashboard") || !ROUTER_TOKEN) return false;
+  const q = new URLSearchParams((req.url || "").split("?")[1] || "");
+  const code = q.get("code");
+  const tok = q.get("token");
+  let ok = false;
+  if (code && dashCodes.has(code) && dashCodes.get(code) > Date.now()) { dashCodes.delete(code); ok = true; }
+  else if (tok && tokenMatches(tok)) ok = true;
+  if (!ok) return false;
+  if (dashSessions.size > 50) dashSessions.delete(dashSessions.keys().next().value);
+  const sid = crypto.randomBytes(24).toString("base64url");
+  dashSessions.set(sid, Date.now() + 8 * 3600_000);
+  res.writeHead(302, {
+    location: "/dashboard",
+    "set-cookie": `rsid=${sid}; HttpOnly; SameSite=Strict; Path=/; Max-Age=28800`,
+  });
+  res.end();
+  return true;
+}
+
+function checkAuth(req, pathname) {
+  if (!ROUTER_TOKEN) return true; // only reachable with allowNoAuth
   const auth = req.headers["authorization"] || "";
-  const token = auth.startsWith("Bearer ") ? auth.slice(7) : auth;
-  if (!token) return false;
-  // Constant-time compare to prevent byte-by-byte timing leaks of the
-  // token via response latency. Length check is NOT constant-time, but
-  // revealing only the *length* of the expected token (not its bytes)
-  // is an acceptable trade-off — and timing-safe buffer compare on
-  // unequal-length inputs would throw.
-  const a = Buffer.from(token);
-  const b = Buffer.from(ROUTER_TOKEN);
-  if (a.length !== b.length) return false;
-  return crypto.timingSafeEqual(a, b);
+  if (tokenMatches(auth.startsWith("Bearer ") ? auth.slice(7) : auth)) return true;
+  // Claude Code sends the key as x-api-key when ANTHROPIC_API_KEY is used.
+  if (tokenMatches(req.headers["x-api-key"])) return true;
+  if (!String(pathname || "").startsWith("/v1/") && hasDashSession(req)) return true;
+  return false;
+}
+
+function hostnameOf(h) {
+  h = String(h || "").toLowerCase().trim();
+  if (h.startsWith("[")) { const i = h.indexOf("]"); return i > 0 ? h.slice(0, i + 1) : h; }
+  return h.split(":")[0];
+}
+
+// H2: reject requests whose Host is not ours (DNS rebinding) and any
+// cross-origin browser request (CSRF / drive-by credit spending). Claude
+// Code and curl send no Origin header, so they are unaffected.
+function guardRequest(req) {
+  const host = req.headers.host;
+  if (!host || !ALLOWED_HOSTS.has(hostnameOf(host))) {
+    return { status: 403, error: "forbidden: unexpected Host header" };
+  }
+  const origin = req.headers.origin;
+  if (origin !== undefined && origin !== `http://${host}` && !ALLOWED_ORIGINS.has(origin)) {
+    return { status: 403, error: "forbidden: cross-origin request" };
+  }
+  if (req.headers["sec-fetch-site"] === "cross-site") {
+    return { status: 403, error: "forbidden: cross-site request" };
+  }
+  return null;
+}
+
+// H2: a body-carrying request must declare JSON, so a webpage cannot smuggle
+// one in as a CORS-"simple" text/plain POST without a preflight.
+function isJsonContentType(req) {
+  return /^application\/json\s*(;|$)/i.test(String(req.headers["content-type"] || ""));
 }
 
 // ---------------------------------------------------------------
@@ -2902,13 +3121,35 @@ const server = http.createServer(async (req, res) => {
     debugLog(`<- ${req.method} ${pathname}`);
   }
 
+  // Defensive response headers on every reply.
+  res.setHeader("x-content-type-options", "nosniff");
+  res.setHeader("x-frame-options", "DENY");
+  res.setHeader("referrer-policy", "no-referrer");
+  res.setHeader("cache-control", "no-store");
+  res.setHeader("cross-origin-resource-policy", "same-origin");
+
+  const blocked = guardRequest(req);
+  if (blocked) {
+    res.writeHead(blocked.status, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: blocked.error }));
+    return;
+  }
+
+  if (tryDashboardLogin(req, res, pathname)) return;
+
   // Dispatch on the path only — Claude Code appends query strings
   // (e.g. /v1/messages?beta=true), and an exact-string match would
   // silently dump those into the un-routed passthrough branch.
   // (pathname computed above, reused here.)
 
   // Proxy auth gate
-  if (!checkAuth(req)) {
+  if (!checkAuth(req, pathname)) {
+    if (req.method === "GET" && pathname === "/dashboard") {
+      res.writeHead(401, { "content-type": "text/plain; charset=utf-8" });
+      res.end("Unauthorized. Open the one-time dashboard URL printed when the router started,\n" +
+              "or /dashboard?token=<router token> (run: claude-smart-router key show router).\n");
+      return;
+    }
     res.writeHead(401, { "content-type": "application/json" });
     res.end(JSON.stringify({ error: "unauthorized" }));
     return;
@@ -2943,8 +3184,16 @@ const server = http.createServer(async (req, res) => {
   // Gated by checkAuth (routerToken if set) and checkRateLimit like every
   // other route — no special-casing. Loopback-only by default.
   if (req.method === "GET" && pathname === "/dashboard") {
-    res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
-    res.end(DASHBOARD_HTML);
+    // CSP with a per-response nonce: no third-party or injected script can
+    // run on the dashboard, and it can only talk to this origin.
+    const nonce = crypto.randomBytes(16).toString("base64");
+    res.writeHead(200, {
+      "content-type": "text/html; charset=utf-8",
+      "content-security-policy":
+        `default-src 'none'; script-src 'nonce-${nonce}'; style-src 'nonce-${nonce}'; style-src-attr 'unsafe-inline'; ` +
+        `connect-src 'self'; img-src data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'`,
+    });
+    res.end(DASHBOARD_HTML.replace(/<(script|style)(?=[\s>])/g, `<$1 nonce="${nonce}"`));
     return;
   }
 
@@ -3115,6 +3364,24 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify({ error: `path not allowed in passthrough: ${pathname}` }));
       return;
     }
+    // SECURITY (M5): per-path method allowlist. Previously ANY method (incl.
+    // DELETE/PUT) was forwarded with your API key attached.
+    const allowedMethods = pathname === "/v1/messages/count_tokens" ? ["POST"]
+      : pathname === "/v1/messages/batches" ? ["GET", "POST"]
+      : ["GET"];
+    if (!allowedMethods.includes(req.method)) {
+      res.writeHead(405, { "content-type": "application/json", allow: allowedMethods.join(", ") });
+      res.end(JSON.stringify({ error: `method ${req.method} not allowed for ${pathname}` }));
+      return;
+    }
+    if (req.method !== "GET" && !isJsonContentType(req)) {
+      res.writeHead(415, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: "content-type must be application/json" }));
+      return;
+    }
+    // Forward only a conservative query string (pagination etc.).
+    const rawQuery = (req.url || "").includes("?") ? "?" + (req.url || "").split("?").slice(1).join("?") : "";
+    const safeQuery = /^\?[A-Za-z0-9_=&.%:\-]{0,512}$/.test(rawQuery) ? rawQuery : "";
     // Passthrough to the default backend, best-effort.
     try {
       const backend = resolveRoute("easy");
@@ -3145,11 +3412,12 @@ const server = http.createServer(async (req, res) => {
         });
       }
       const upstream = await fetch(
-        `${backend.baseUrl.replace(/\/$/, "")}${req.url}`,
+        `${backend.baseUrl.replace(/\/$/, "")}${pathname}${safeQuery}`,
         {
           method: req.method,
           headers,
           body: bodyChunks.length ? Buffer.concat(bodyChunks) : undefined,
+          signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS), // M6
         }
       );
       // Strip hop-by-hop / encoding headers: fetch() already transparently
@@ -3190,6 +3458,11 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  if (!isJsonContentType(req)) {
+    res.writeHead(415, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: "content-type must be application/json" }));
+    return;
+  }
   let body;
   try {
     body = await readJsonBody(req, MAX_BODY_BYTES);
@@ -3411,13 +3684,12 @@ const server = http.createServer(async (req, res) => {
     countUserTextTurns(body.messages) >= COMPACT_HINT_TURNS &&
     repoMapFirstIdx >= 0
   ) {
-    const hint =
-      "\n\n[router: this conversation is getting long. Consider running /compact " +
-      "to reduce context and improve response quality. You can also set " +
-      "compactHintTurns in config.json to adjust this threshold.]";
-    appendTextToMessage(body.messages[repoMapFirstIdx], hint);
+    // H3: out-of-band notice only - the prompt is not modified.
+    console.log(
+      `[router] notice (session ${key.slice(0, 8)}): conversation is ${countUserTextTurns(body.messages)} turns long - ` +
+      `consider running /compact in Claude Code`
+    );
     sessionCompactedHint.set(key, true);
-    debugLog(`compaction hint injected at ${countUserTextTurns(body.messages)} turns`);
   }
 
   // Credit hints (one per session): 5h/weekly threshold crossing or a
@@ -3592,9 +3864,26 @@ const server = http.createServer(async (req, res) => {
     await pollZaiAccountUsage();
   }
 
+  // H2: never expose an unauthenticated proxy beyond loopback.
+  if (ALLOW_NO_AUTH && !LOOPBACK_HOSTNAMES.has(String(HOST).toLowerCase())) {
+    console.error(`[router] Refusing to bind ${HOST} with authentication disabled (allowNoAuth).`);
+    process.exit(1);
+  }
+
   server.listen(PORT, HOST, () => {
     const displayHost = HOST === "0.0.0.0" || HOST === "::" ? "localhost" : HOST;
-    const dashboardUrl = `http://${displayHost}:${PORT}/dashboard`;
+    const dashboardBase = `http://${displayHost}:${PORT}/dashboard`;
+    const dashboardUrl = ROUTER_TOKEN ? `${dashboardBase}?code=${mintDashboardCode()}` : dashboardBase;
+    if (GENERATED_TOKEN) {
+      // Written straight to the terminal (not console.*) so it never enters
+      // the /logs ring. Shown once; retrieve later with: key show router
+      process.stdout.write(
+        "\n[router] Generated a proxy token (stored in " + KEYSTORE_PATH + ").\n" +
+        "[router] Point Claude Code at it:\n" +
+        "[router]   ANTHROPIC_BASE_URL=http://" + displayHost + ":" + PORT + "\n" +
+        "[router]   ANTHROPIC_AUTH_TOKEN=" + ROUTER_TOKEN + "\n\n"
+      );
+    }
     console.log(`[router] listening on http://${displayHost}:${PORT} (bind: ${HOST})`);
     console.log(`[router] dashboard: ${dashboardUrl}` + (OPEN_DASHBOARD_ON_START ? " (auto-opening browser)" : " (set openDashboardOnStart:true in config.json to auto-open)"));
     if (OPEN_DASHBOARD_ON_START) openBrowser(dashboardUrl);
@@ -3690,7 +3979,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (ROUTER_TOKEN) console.log(`[router] proxyAuth=enabled`);
-    else console.log(`[router] proxyAuth=disabled (set routerToken in config or ROUTER_TOKEN env to enable)`);
+    else console.warn(`[router] proxyAuth=DISABLED via allowNoAuth - any local process or web page can use your credits`);
 
     if (RATE_LIMIT_RPM > 0) {
       console.log(`[router] rateLimit=${RATE_LIMIT_RPM}rpm burst=+${RATE_LIMIT_BURST} trustXff=${RATE_LIMIT_CFG?.trustXff === true}`);

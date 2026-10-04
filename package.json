@@ -1,6 +1,6 @@
 {
   "name": "claude-smart-router",
-  "version": "1.7.3",
+  "version": "1.8.0",
   "description": "Local proxy for Claude Code: routes requests between GLM/Claude by complexity and auto-clarifies ambiguous prompts.",
   "main": "router.js",
   "bin": {
@@ -17,7 +17,7 @@
   ],
   "scripts": {
     "start": "node router.js",
-    "test": "node test/run-tests.js && node test/security-tests.js && node test/extra-probes.js"
+    "test": "node test/run-tests.js && node test/security-tests.js && node test/extra-probes.js && node test/hardening-tests.js"
   },
   "engines": {
     "node": ">=18"

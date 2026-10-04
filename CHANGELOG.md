@@ -3,6 +3,25 @@
 All notable changes to `claude-smart-router` are documented here.
 See [README.md](README.md) for setup and usage.
 
+## 1.8.0 (Security hardening)
+
+**Behaviour changes - read before upgrading**
+- The router **no longer writes any text into your prompt** except the optional repo map. Credit/peak hints, the `/compact` hint and the auto-clarification note are now terminal + dashboard notices only. This also fixes usage text being echoed back by the model.
+- **Auth is mandatory.** A random token is generated on first start (stored in the keystore, printed once, `key show router` to reprint). Set Claude Code's `ANTHROPIC_AUTH_TOKEN` to it. `allowNoAuth` / `ROUTER_ALLOW_NO_AUTH=1` opts out (loopback only).
+- **Config/.env/ROUTES.md are no longer read from the current directory.** Use `ROUTER_CONFIG`, `~/.claude-smart-router/`, or the install dir (`ROUTER_ALLOW_CWD_CONFIG=1` to restore the old behaviour).
+- **Upstream allowlist**: https only (http for localhost), no URL credentials, host must be in `allowedUpstreamHosts` (default `api.z.ai`, `api.anthropic.com`).
+
+**Fixes**
+- H1: key-exfiltration via a hostile project `config.json`/`.env`.
+- H2: DNS rebinding and cross-site POSTs (Host/Origin/Sec-Fetch-Site checks, JSON content-type required); dashboard login via one-time code + scoped cookie; CSP nonce and security headers; token compare on SHA-256 digests.
+- H3: classifier-generated "assumptions" can no longer reach the model (denylist sanitizer was bypassable).
+- M2: repo-map file names sanitized; pinned files checked with realpath (symlink escape).
+- M4: keystore dir 0700 / file 0600 enforced on every write and repaired on load.
+- M5: passthrough per-path method allowlist, query-string allowlist, request timeout.
+- M7: exact-value redaction of all held secrets, plus JWT / z.ai key / PEM patterns.
+- Dashboard: poll-error message no longer rendered as HTML.
+- Tests: new `test/hardening-tests.js` (65 checks; 61 on Windows, where the POSIX-permission checks are skipped); existing suites updated for log-only notices.
+
 ## 1.7.3 (Repo map byte-stability)
 
 - **Issue #**: Snapshots the `compactThreshold` numerical value at freeze time so mid-session config updates don't erroneously shrink the repo map prematurely.

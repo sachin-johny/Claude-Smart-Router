@@ -10,6 +10,9 @@
 
   "routerToken": null,
 
+  "allowedUpstreamHosts": ["api.z.ai"],
+  "allowedHosts": [],
+
   "rateLimit": null,
 
   "openDashboardOnStart": false,

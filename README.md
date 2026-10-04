@@ -13,12 +13,12 @@ Anthropic Messages API — instead of you manually switching models.
 3. **Tool-aware floor**: when a request includes tool definitions, complexity
    is bumped to at least `tools.minComplexity` (default `medium`) — cheap
    models tend to be worse at safe tool use, so this is a guardrail.
-4. **Auto-clarification**: genuinely ambiguous prompts get a short block of
-   stated assumptions appended — your original message is never edited, and
-   the note only appears on the turn that triggered it, not on every
-   follow-up afterward. Assumptions coming back from the classifier are
-   sanitized first: anything resembling a tool invocation, file path, URL,
-   env var, or secret reference is dropped instead of appended.
+4. **Auto-clarification (log-only)**: genuinely ambiguous prompts produce a
+   short list of assumptions that is shown to YOU in the terminal/dashboard.
+   Nothing is appended to your message or sent to the model — doing so let a
+   prompt-injected classifier speak with your voice. The displayed list is still
+   run through the (best-effort) sanitizer, which drops anything resembling a
+   tool call, path, URL, env var or secret reference.
 5. **Customizable classifier prompt** via `ROUTES.md` — edit the triage
    instructions without touching code.
 6. Supports **Ollama** as a free local classifier/backend, and Claude Code
@@ -126,12 +126,24 @@ as an explicit override. What it controls:
   classify.
 - `classifyCacheTtlMs` (default `60000`) — cache classifications by message
   text. Set `0` to disable.
-- `compactHintTurns` (default `15`) — inject a one-time hint suggesting
-  `/compact` after this many user turns in a session.
+- `compactHintTurns` (default `15`) — log a one-time notice (terminal +
+  dashboard) suggesting `/compact` after this many user turns. It is **never**
+  written into the prompt.
 - `credits` — GLM Coding Plan credit tracking (see below).
-- `routerToken` — optional. If set, the proxy requires
-  `Authorization: Bearer <token>` on every request (compared in constant
-  time). Leave `null` for local single-user use.
+- `routerToken` — the proxy requires `Authorization: Bearer <token>` (or
+  `x-api-key`) on every request, compared in constant time. If you leave it
+  `null` (and no `ROUTER_TOKEN`/keystore value exists) a random 256-bit token is
+  generated on first start, stored in `~/.claude-smart-router/keys.json` and
+  printed once; show it again with `claude-smart-router key show router`.
+  `allowNoAuth: true` (or `ROUTER_ALLOW_NO_AUTH=1`) disables auth for tests/CI
+  and is refused on any non-loopback bind.
+- `allowedUpstreamHosts` — hosts your API keys may be sent to (default
+  `api.z.ai`, `api.anthropic.com`, plus loopback). The router refuses to start
+  if a route/classifier `baseUrl` is not https (plain http only for localhost),
+  has embedded credentials, or points elsewhere.
+- `allowedHosts` / `allowedOrigins` — extra `Host` / `Origin` values accepted
+  (defaults: loopback only). Requests with any other `Host` (DNS rebinding) or
+  a cross-origin `Origin` get `403`.
 - `rateLimit` — optional per-IP rate limit, e.g. `{ "rpm": 60 }`.
   Requests are counted in a sliding 60s window with `burst` headroom
   (default `rpm`/2); over the limit the proxy answers `429` with a
@@ -181,9 +193,9 @@ Edit `~/.claude/settings.json`:
 }
 ```
 
-The auth token value only matters if you set `routerToken` in `config.json` —
-otherwise it's ignored, and the router uses the real per-backend API keys
-from your config. **Fully restart VS Code** after editing this file.
+Set `ANTHROPIC_AUTH_TOKEN` to the **router token** (printed on first start, or
+`claude-smart-router key show router`) — the router checks it, then uses the
+real per-backend API keys from your config upstream. **Fully restart VS Code** after editing this file.
 
 ## Customizing the classifier prompt (ROUTES.md)
 
@@ -228,8 +240,10 @@ Set `ROUTER_ENV_PATH` if you want the env file somewhere other than next to
 - `skipClassifyMinWords` (default `4`) — messages shorter than this skip
   triage; they either default to `super_easy` or inherit complexity from
   session context if one exists.
-- `clarify` — set `false` to disable assumption-appending while keeping
-  complexity routing (JSON mode only).
+- `clarify` — when `true` (default), ambiguity assumptions from the classifier
+  are **logged for you** (terminal + dashboard) but never forwarded to the
+  model; routing is unaffected (JSON mode only). Appending model-generated text
+  to your message was removed because it is a prompt-injection channel.
 - `upstreamTimeoutMs` (default `120000`) — abort a stuck upstream call.
 - `maxSessions` (default `500`) — cap on in-memory session tracking; oldest
   entries are evicted once exceeded.
@@ -319,10 +333,13 @@ All under `config.classifier.*`, safe defaults so existing configs work unchange
   route `/compact` to `hard` instead of `medium` (larger context = harder
   summarization).
 
-Config, `.env`, and `ROUTES.md` are resolved from the **current working
-directory** first, then next to `router.js` — so a global install finds
-your files wherever you run it. Explicit env vars (`ROUTER_CONFIG`,
-`ROUTER_ENV_PATH`, `ROUTES_PATH`) always win. API keys resolve as
+Config, `.env`, and `ROUTES.md` are resolved from an explicit env var
+(`ROUTER_CONFIG`, `ROUTER_ENV_PATH`, `ROUTES_PATH`), then
+`~/.claude-smart-router/`, then next to `router.js`. **The current working
+directory is deliberately not searched** — a cloned repo could otherwise ship a
+`config.json` that redirects your API key to its own server. Opt back in with
+`ROUTER_ALLOW_CWD_CONFIG=1` only for directories you trust (the upstream
+allowlist still applies). API keys resolve as
 **environment variables > `key set` keystore > `.env` > config.json**.
 Invalid configs (bad JSON, missing routes/model/baseUrl) fail at startup
 with a list of exactly what's wrong instead of erroring per-request later.
@@ -515,8 +532,9 @@ Plan's two windows:
   weekends and off-peak hours — bills at 0.5×. Peak state is computed
   from UTC+8 regardless of the machine's timezone.
 - **No forced downgrades.** Crossing `warnPct` (default 80%) of either
-  window injects a one-time hint per session and logs a warning; a
-  peak-hours notice is injected once per session while hints are on. The
+  window logs a one-time notice per session (terminal + dashboard); the
+  peak-hours notice works the same way while hints are on. Notices are never
+  inserted into the conversation. The
   routing decision stays yours.
 - `GET /credits` returns the full snapshot; `/health` carries the
   percentages. The ledger persists to `credits-state.json` (debounced,
@@ -606,3 +624,27 @@ fix/feature by release.
 ## License
 
 MIT — see [LICENSE](./LICENSE).
+
+## Security model
+
+- **Authentication is mandatory.** A token is required on every request;
+  browsers get a one-time-code login that yields an `HttpOnly; SameSite=Strict`
+  cookie valid for dashboard/read endpoints only (never `/v1/*`).
+- **Browser attacks are blocked**: unexpected `Host` (DNS rebinding), any
+  cross-origin `Origin`/`Sec-Fetch-Site`, and non-JSON bodies are rejected.
+  The dashboard is served with a nonce-based CSP.
+- **Keys only go where you allow**: https-only upstream allowlist, enforced at
+  startup; config is never loaded from the working directory by default.
+- **The prompt is never modified by the router** except the optional repo map
+  (file names are reduced to a safe charset; pinned files must resolve inside
+  the project root after symlink resolution).
+- **Logs**: pattern-based redaction plus exact-value redaction of every key the
+  router holds.
+- Keystore: directory `0700`, file `0600` (re-applied each write; repaired on
+  load). On Windows POSIX modes do not apply - the file inherits your profile ACL.
+- Not covered: the 120 s upstream timeout stops at response headers (a stalled
+  stream is not cut), and the router cannot stop prompt injection that arrives
+  through *your own* pasted content or tool results - Claude Code's permission
+  prompts remain your main defence there.
+
+Run everything with `npm test` (includes `test/hardening-tests.js`).

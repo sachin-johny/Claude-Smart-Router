@@ -133,6 +133,9 @@ async function startRouter(configFile, env = {}) {
       USERPROFILE: LOG_DIR,
       HOME: LOG_DIR,
       PORT: String(ROUTER_PORT),
+      // Hardening: auth is mandatory by default; the functional suite opts
+      // out (test/hardening-tests.js covers the auth-on behaviour).
+      ROUTER_ALLOW_NO_AUTH: "1",
       ...env,
     },
     stdio: ["ignore", "pipe", "pipe"],
@@ -508,7 +511,7 @@ async function runTests() {
     eq(chatCalls()[1].model, "tier-flash", "session stores super_easy, not the bumped medium");
   });
 
-  await test("json: ambiguous prompt gets clarification note appended", async () => {
+  await test("json: ambiguous prompt is NOT rewritten (assumptions are log-only)", async () => {
     clearLog();
     setReply(JSON.stringify({
       complexity: "medium",
@@ -519,11 +522,14 @@ async function runTests() {
       messages: [{ role: "user", content: "write a script to process the file and output the results somewhere useful" }],
     }));
     const sent = chatCalls()[0].body.messages[0].content;
-    ok(String(sent).includes("router auto-clarification"), "clarification note appended", sent);
-    ok(String(sent).includes("- Assume JavaScript"), "assumption listed", sent);
+    eq(sent, "write a script to process the file and output the results somewhere useful",
+       "user message forwarded byte-for-byte, nothing appended");
+    ok(!String(sent).includes("router auto-clarification"), "no clarification note in prompt", sent);
+    await new Promise((r) => setTimeout(r, 200));
+    ok(routerStdout().includes("clarify (shown here only"), "assumptions logged for the operator instead");
   });
 
-  await test("json: inherited turn does NOT re-append clarification note", async () => {
+  await test("json: inherited turn never carries a clarification note", async () => {
     clearLog();
     setReply(JSON.stringify({
       complexity: "medium",
@@ -535,8 +541,8 @@ async function runTests() {
       messages: [{ role: "user", content: AMB }],
     }));
     ok(
-      String(chatCalls()[0].body.messages[0].content).includes("router auto-clarification"),
-      "turn 1 has note"
+      !String(chatCalls()[0].body.messages[0].content).includes("router auto-clarification"),
+      "turn 1 has no note (log-only)"
     );
     await post("/v1/messages", msgBody({
       messages: [
@@ -1451,7 +1457,7 @@ async function runTests() {
       await stopRouter();
     });
 
-    await test("credits: threshold hint injected once per session", async () => {
+    await test("credits: threshold notice is logged once per session and NEVER injected into the prompt", async () => {
       const { path: cfgP } = creditConfig("hint", { hints: true, peakHint: false });
       await startRouter(cfgP, { ROUTES_PATH: NO_ROUTES });
       clearLog();
@@ -1476,12 +1482,15 @@ async function runTests() {
         }
         return "";
       };
-      ok(!lastUserTextOf(calls[0]).includes("[router:"), "turn 1 has no hint (deferred — single user message)");
-      ok(lastUserTextOf(calls[1]).includes("5-hour GLM credit window"), "turn 2 carries the threshold hint (on last user msg)");
+      for (const c of calls) {
+        ok(!JSON.stringify(c.body.messages).includes("[router:"), "no router text in any forwarded message");
+        ok(!lastUserTextOf(c).includes("GLM credit window"), "no credit text in the user message");
+      }
+      await new Promise((r) => setTimeout(r, 250));
       eq(
-        (lastUserTextOf(calls[2]).match(/5-hour GLM credit window/g) || []).length,
-        0,
-        "turn 3 carries no repeat hint (client resends clean messages)"
+        (routerStdout().match(/notice \(session [0-9a-f]+\): [^\n]*5-hour GLM credit window/g) || []).length,
+        1,
+        "threshold notice logged exactly once for the session (out-of-band)"
       );
       await stopRouter();
     });
@@ -1599,7 +1608,9 @@ async function runTests() {
     const calls = chatCalls();
     eq(calls.length, 1, "one chat call");
     const userMsg = JSON.stringify(calls[0].body.messages[0]);
-    ok(userMsg.includes("Using JavaScript as the language"), "safe assumption is preserved", userMsg);
+    ok(!userMsg.includes("Using JavaScript as the language"), "even SAFE assumptions are no longer forwarded to the model", userMsg);
+    await new Promise((r) => setTimeout(r, 200));
+    ok(routerStdout().includes("clarify (shown here only") && routerStdout().includes("Using JavaScript as the language"), "safe assumption is logged for the operator");
     ok(!userMsg.includes("~/.ssh/id_rsa"), "ssh path assumption is dropped", userMsg);
     ok(!userMsg.includes("evil.com"), "URL-bearing assumption is dropped", userMsg);
     ok(!userMsg.toLowerCase().includes("exfiltrate"), "exfiltration verb assumption is dropped", userMsg);
@@ -1647,7 +1658,9 @@ async function runTests() {
     eq(calls.length, 1, "one chat call");
     const userMsg = JSON.stringify(calls[0].body.messages[0]);
     ok(!userMsg.includes(longAssumption), "long assumption (>200 chars) is dropped", userMsg.slice(0, 100));
-    ok(userMsg.includes("Using JavaScript as the language"), "short assumption is preserved", userMsg);
+    ok(!userMsg.includes("Using JavaScript as the language"), "nothing is forwarded to the model", userMsg);
+    await new Promise((r) => setTimeout(r, 200));
+    ok(routerStdout().includes("Using JavaScript as the language"), "short assumption is logged");
     await stopRouter();
   });
 
@@ -2570,12 +2583,16 @@ async function runTests() {
     eq(calls.length, 1, "one chat call");
     const userMsg = JSON.stringify(calls[0].body.messages[0]);
     // The safe assumptions must be preserved WITH their original casing.
-    ok(userMsg.includes("Using JavaScript as the language"),
-      "mixed-case assumption preserved verbatim (not lowercased)", userMsg);
-    ok(userMsg.includes("Node 18 LTS"),
-      "proper-noun assumption preserved verbatim", userMsg);
-    ok(userMsg.includes("ESM modules"),
-      "acronym assumption preserved verbatim", userMsg);
+    // Assumptions are log-only now; casing must still survive parsing.
+    await new Promise((r) => setTimeout(r, 200));
+    const out = routerStdout();
+    ok(out.includes("Using JavaScript as the language"),
+      "mixed-case assumption preserved verbatim (not lowercased)", out.slice(-400));
+    ok(out.includes("Node 18 LTS"),
+      "proper-noun assumption preserved verbatim");
+    ok(out.includes("ESM modules"),
+      "acronym assumption preserved verbatim");
+    ok(!userMsg.includes("Using JavaScript"), "and none of it is forwarded to the model", userMsg);
     await stopRouter();
   });
 

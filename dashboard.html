@@ -517,7 +517,8 @@ async function pollHealth() {
     $("rm-bytes").textContent = fmtBytes(h.repoMapBytes);
     $("rm-tokens").textContent = h.repoMapBytes ? Math.ceil(h.repoMapBytes / 4).toLocaleString() : "—";
   } catch (e) {
-    $("meta").innerHTML = '<span class="err">poll failed: ' + e.message + " — retrying…</span>";
+    $("meta").innerHTML = '<span class="err"></span>';
+    $("meta").firstChild.textContent = "poll failed: " + e.message + " — retrying…";
   }
 }
 async function pollCredits() {

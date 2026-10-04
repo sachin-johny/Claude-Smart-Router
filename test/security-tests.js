@@ -107,6 +107,7 @@ async function startRouter(configFile, env = {}) {
       USERPROFILE: LOG_DIR,
       HOME: LOG_DIR,
       PORT: String(ROUTER_PORT),
+      ROUTER_ALLOW_NO_AUTH: "1",
       ...env,
     },
     stdio: ["ignore", "pipe", "pipe"],
