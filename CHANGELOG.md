@@ -3,39 +3,93 @@
 All notable changes to `claude-smart-router` are documented here.
 See [README.md](README.md) for setup and usage.
 
+## 1.8.5 (Repo map file mode)
+
+- **New: file mode for the repo map.** Set `repoMap.writeToFile` (e.g.
+  `.claude/repo-map.md`) and the router maintains a generated map file in
+  your project instead of injecting into prompts — file tree + exports,
+  uncommitted changes, recent commits (with the files they touched), and
+  recently modified files. Kept current by a settled change watcher that
+  rewrites atomically and only when content actually changed.
+- **New: `claude-smart-router map`** — regenerate the map file once and
+  exit (hooks/CI); skips router-token generation.
+- File mode safety: target must be a `.md` inside the project root, never
+  a hand-written doc (CLAUDE.md/README.md/AGENTS.md/GEMINI.md), never a
+  symlink, and never a file missing the router's marker line; git is
+  invoked shell-less with fixed arguments and a timeout; commit subjects
+  and paths are reduced to a safe charset.
+- `repoMap.enabled: false` + `writeToFile` = file-only. `inject: true`
+  restores prompt injection alongside the file (paid for twice).
+- `allowNoAuth` combined with an existing router token (env, keystore or
+  config) now prints a warning that auth stays ON instead of silently
+  ignoring it; token generation is skipped for the `map` subcommand.
+- `POST /map/refresh` returns a `file` object in file mode; `GET /map`
+  works in file mode too.
+
 ## 1.8.0 (Security hardening)
 
 **Behaviour changes - read before upgrading**
-- The router **no longer writes any text into your prompt** except the optional repo map. Credit/peak hints, the `/compact` hint and the auto-clarification note are now terminal + dashboard notices only. This also fixes usage text being echoed back by the model.
-- **Auth is mandatory.** A random token is generated on first start (stored in the keystore, printed once, `key show router` to reprint). Set Claude Code's `ANTHROPIC_AUTH_TOKEN` to it. `allowNoAuth` / `ROUTER_ALLOW_NO_AUTH=1` opts out (loopback only).
-- **Config/.env/ROUTES.md are no longer read from the current directory.** Use `ROUTER_CONFIG`, `~/.claude-smart-router/`, or the install dir (`ROUTER_ALLOW_CWD_CONFIG=1` to restore the old behaviour).
-- **Upstream allowlist**: https only (http for localhost), no URL credentials, host must be in `allowedUpstreamHosts` (default `api.z.ai`, `api.anthropic.com`).
+- The router **no longer writes any text into your prompt** except the
+  optional repo map. Credit/peak hints, the `/compact` hint and the
+  auto-clarification note are now terminal + dashboard notices only. This
+  also fixes usage text being echoed back by the model.
+- **Auth is mandatory.** A random token is generated on first start
+  (stored in the keystore, printed once, `key show router` to reprint).
+  Set Claude Code's `ANTHROPIC_AUTH_TOKEN` to it. `allowNoAuth` /
+  `ROUTER_ALLOW_NO_AUTH=1` opts out (loopback only).
+- **Config/.env/ROUTES.md are no longer read from the current
+  directory.** Use `ROUTER_CONFIG`, `~/.claude-smart-router/`, or the
+  install dir (`ROUTER_ALLOW_CWD_CONFIG=1` to restore the old behaviour).
+- **Upstream allowlist**: https only (http for localhost), no URL
+  credentials, host must be in `allowedUpstreamHosts` (default
+  `api.z.ai`, `api.anthropic.com`).
 
 **Fixes**
 - H1: key-exfiltration via a hostile project `config.json`/`.env`.
-- H2: DNS rebinding and cross-site POSTs (Host/Origin/Sec-Fetch-Site checks, JSON content-type required); dashboard login via one-time code + scoped cookie; CSP nonce and security headers; token compare on SHA-256 digests.
-- H3: classifier-generated "assumptions" can no longer reach the model (denylist sanitizer was bypassable).
-- M2: repo-map file names sanitized; pinned files checked with realpath (symlink escape).
-- M4: keystore dir 0700 / file 0600 enforced on every write and repaired on load.
-- M5: passthrough per-path method allowlist, query-string allowlist, request timeout.
-- M7: exact-value redaction of all held secrets, plus JWT / z.ai key / PEM patterns.
+- H2: DNS rebinding and cross-site POSTs (Host/Origin/Sec-Fetch-Site
+  checks, JSON content-type required); dashboard login via one-time
+  code + scoped cookie; CSP nonce and security headers; token compare
+  on SHA-256 digests.
+- H3: classifier-generated "assumptions" can no longer reach the model
+  (denylist sanitizer was bypassable).
+- M2: repo-map file names sanitized; pinned files checked with realpath
+  (symlink escape).
+- M4: keystore dir 0700 / file 0600 enforced on every write and repaired
+  on load.
+- M5: passthrough per-path method allowlist, query-string allowlist,
+  request timeout.
+- M7: exact-value redaction of all held secrets, plus JWT / z.ai key /
+  PEM patterns.
 - Dashboard: poll-error message no longer rendered as HTML.
-- Tests: new `test/hardening-tests.js` (65 checks; 61 on Windows, where the POSIX-permission checks are skipped); existing suites updated for log-only notices.
+- Tests: new `test/hardening-tests.js` (65 checks; 61 on Windows, where
+  the POSIX-permission checks are skipped); existing suites updated for
+  log-only notices.
 
 ## 1.7.3 (Repo map byte-stability)
 
-- **Issue #**: Snapshots the `compactThreshold` numerical value at freeze time so mid-session config updates don't erroneously shrink the repo map prematurely.
-- **Issue #2**: Preserves leading whitespace for array-based map content, preventing a prompt cache break when switching from string- to array-based first messages.
-- **Issue #3**: `REPO_MAP_CODE_NOEXT` ensures extensionless files like `Makefile` and `Dockerfile` are successfully injected into the repo map and no longer skipped by the compact view.
+- **Issue #**: Snapshots the `compactThreshold` numerical value at freeze
+  time so mid-session config updates don't erroneously shrink the repo
+  map prematurely.
+- **Issue #2**: Preserves leading whitespace for array-based map content,
+  preventing a prompt cache break when switching from string- to
+  array-based first messages.
+- **Issue #3**: `REPO_MAP_CODE_NOEXT` ensures extensionless files like
+  `Makefile` and `Dockerfile` are successfully injected into the repo map
+  and no longer skipped by the compact view.
 - **Issue #4**: Expanded testing for post-flip byte stability.
 
 ## 1.7.2 (Engineering review fixes)
 
-- **Issue #1**: Fixed keyword-mode assumption parsing casing for proper nouns by preserving original case.
-- **Issue #2**: Removed redundant `Message:` label when replacing `{MESSAGE}` to prevent template issues.
-- **Issue #3**: Tightened design and refactor rules to use verb-anchors, preventing false positives on questions.
-- **Issue #4**: Extracted 588-line dashboard HTML string to its own `dashboard.html` file and added it to package exports.
-- **Issue #5**: Stripped `DEBUG` and `DASHBOARD_DEBUG` from parent environment when running tests to ensure isolation.
+- **Issue #1**: Fixed keyword-mode assumption parsing casing for proper
+  nouns by preserving original case.
+- **Issue #2**: Removed redundant `Message:` label when replacing
+  `{MESSAGE}` to prevent template issues.
+- **Issue #3**: Tightened design and refactor rules to use verb-anchors,
+  preventing false positives on questions.
+- **Issue #4**: Extracted 588-line dashboard HTML string to its own
+  `dashboard.html` file and added it to package exports.
+- **Issue #5**: Stripped `DEBUG` and `DASHBOARD_DEBUG` from parent
+  environment when running tests to ensure isolation.
 
 ## 1.7.0 (z.ai account-usage overlay + dashboard refresh)
 

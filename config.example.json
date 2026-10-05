@@ -34,7 +34,18 @@
     "ttlMs": 10000,
     "pinnedFiles": [],
     "compactAfter": { "super_hard": 4, "hard": 5, "medium": 6 },
-    "writeToFile": null
+    "writeToFile": null,
+    "inject": null,
+    "watch": true,
+    "watchIntervalMs": 3000,
+    "recentDays": 3,
+    "recentFiles": 15,
+    "git": {
+      "enabled": true,
+      "commits": 15,
+      "maxUncommitted": 25,
+      "respectGitignore": true
+    }
   },
 
   "costWeights": {

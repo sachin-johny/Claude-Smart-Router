@@ -116,7 +116,7 @@ auto-clarification; delete the file to get it back.
 ## HTTP endpoints
 
 | Endpoint | What it does |
-|---|---|
+| --- | --- |
 | `POST /v1/messages` | the proxy itself (what Claude Code calls) |
 | `GET /health` | liveness: uptime, sessions, budget, credits, breaker state |
 | `GET /credits` | live GLM plan usage: 5h/weekly totals, resets, peak state |
@@ -138,20 +138,30 @@ first user message, so the model knows the project without you
 `@`-mentioning files. The map is frozen per session and reuses the same
 bytes every turn, so after the first write it sits in the prompt-cached
 prefix (~10% of base input cost). After several turns it auto-compacts to
-a one-liner. Optionally write it to a file with `writeToFile` for
-CLAUDE.md `@`-inclusion (set `repoMap.enabled: false` if you do, to avoid
-paying twice).
+a one-liner.
+
+**File mode**: set `writeToFile` (e.g. `.claude/repo-map.md`) and the
+router maintains a generated map file in your project *instead of*
+injecting into prompts - the file tree plus uncommitted changes, recent
+commits, and recently modified files, kept current by a change watcher
+(never overwrites files it didn't generate; target must be a `.md` inside
+the project root). The model reads it on demand: add a line like
+`Before searching for files, read .claude/repo-map.md` to your CLAUDE.md,
+or regenerate once from a hook/CI with `claude-smart-router map`. Works
+with `repoMap.enabled: false`; opt back into prompt injection with
+`inject: true` (the map is then paid for twice).
 
 ```json
 "repoMap": {
   "enabled": true,
   "maxTokens": 2000,
   "minComplexity": "medium",
-  "pinnedFiles": []
+  "pinnedFiles": [],
+  "writeToFile": ".claude/repo-map.md"
 }
 ```
 
-`GET /map` shows exactly what gets injected.
+`GET /map` shows the current map; `POST /map/refresh` forces a rebuild.
 
 ## Credit tracking (GLM Coding Plan)
 
