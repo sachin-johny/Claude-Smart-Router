@@ -5,3 +5,4 @@ credits-state.json
 
 # Test artifacts
 test/logs
+.claude/

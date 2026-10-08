@@ -7,6 +7,7 @@ const { spawn } = require("child_process");
 const zlib = require("zlib");
 const http = require("http");
 const fs = require("fs");
+const os = require("os");
 const path = require("path");
 
 const ROOT = path.join(__dirname, "..");
@@ -38,6 +39,9 @@ const upstream = http.createServer((req, res) => {
 let routerProc = null;
 async function main() {
   await new Promise((r) => upstream.listen(9950, r));
+  // Hermetic HOME: without this the router inherits the real one, picks up a
+  // developer's keys.json (auth ON -> 401s) and writes live credits state.
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "csr-probe-home-"));
   console.log("[probe] gzipping upstream on :9950");
 
   const cfg = {
@@ -49,7 +53,7 @@ async function main() {
   fs.writeFileSync(cfgPath, JSON.stringify(cfg));
 
   routerProc = spawn(process.execPath, [path.join(ROOT, "router.js")], {
-    env: { ...process.env, ROUTER_CONFIG: cfgPath, ROUTES_PATH: path.join(LOG_DIR, "none.md"), ROUTER_ENV_PATH: path.join(LOG_DIR, "no-env-file"), PORT: "9878", ROUTER_ALLOW_NO_AUTH: "1" },
+    env: { ...process.env, HOME: homeDir, USERPROFILE: homeDir, ROUTER_CONFIG: cfgPath, ROUTES_PATH: path.join(LOG_DIR, "none.md"), ROUTER_ENV_PATH: path.join(LOG_DIR, "no-env-file"), PORT: "9878", ROUTER_ALLOW_NO_AUTH: "1" },
     stdio: ["ignore", "pipe", "pipe"],
   });
   await new Promise((r) => {
@@ -98,7 +102,7 @@ async function main() {
   routerProc.kill("SIGTERM");
   await new Promise((r) => setTimeout(r, 300));
   routerProc = spawn(process.execPath, [path.join(ROOT, "router.js")], {
-    env: { ...process.env, ROUTER_CONFIG: cfgPath2, ROUTES_PATH: path.join(LOG_DIR, "none.md"), ROUTER_ENV_PATH: path.join(LOG_DIR, "no-env-file"), PORT: "9878", ROUTER_ALLOW_NO_AUTH: "1" },
+    env: { ...process.env, HOME: homeDir, USERPROFILE: homeDir, ROUTER_CONFIG: cfgPath2, ROUTES_PATH: path.join(LOG_DIR, "none.md"), ROUTER_ENV_PATH: path.join(LOG_DIR, "no-env-file"), PORT: "9878", ROUTER_ALLOW_NO_AUTH: "1" },
     stdio: "ignore",
   });
   await new Promise((r) => setTimeout(r, 800));

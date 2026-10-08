@@ -36,16 +36,15 @@
     "compactAfter": { "super_hard": 4, "hard": 5, "medium": 6 },
     "writeToFile": null,
     "inject": null,
+    "managePointer": false,
     "watch": true,
     "watchIntervalMs": 3000,
+    "git": { "enabled": true, "commits": 15, "maxUncommitted": 25, "respectGitignore": true, "historyDepth": 500 },
     "recentDays": 3,
     "recentFiles": 15,
-    "git": {
-      "enabled": true,
-      "commits": 15,
-      "maxUncommitted": 25,
-      "respectGitignore": true
-    }
+    "fileTokens": 6000,
+    "exclude": ["fixtures", "__fixtures__", "testdata", "__snapshots__", "snapshots"],
+    "detail": { "project": true, "commands": true, "imports": true, "signatures": true, "docs": true, "todos": true, "envVars": true, "hotspots": true, "coChange": true }
   },
 
   "costWeights": {

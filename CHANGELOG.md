@@ -3,6 +3,52 @@
 All notable changes to `claude-smart-router` are documented here.
 See [README.md](README.md) for setup and usage.
 
+## 1.9.0 (Repo map rewritten for agents)
+
+The file-mode map is no longer a bare tree — it is an orientation document
+with what an agent needs before it starts searching:
+
+- Per file: **definitions with signature, exact line range and one-line
+  purpose** (JSDoc / line comments / Python docstrings), extracted from
+  the whole file (was: exports from the first 64 KB, 8 bare names), plus
+  `entry` / `[test]` tags, line count, and last commit (date + hash) with
+  `*` uncommitted / `new` untracked flags — so the model can
+  `Read offset/limit` just the relevant range, or skip the file entirely.
+- **Relations**: `uses:` / `used by:` / `tests:` resolved from local
+  imports (JS/TS, Python, Ruby) plus test-naming conventions
+  (`foo.test.js`, `test_foo.py`) — the blast radius before editing.
+- **Project** section (languages, package manager, runtime version,
+  config files, CI) and **Commands** section (package.json scripts,
+  Makefile targets, `main`/`bin` entry points).
+- **Environment variables** read (names only), **TODO/FIXME** markers
+  (real comment convention only — prose and regexes are not tasks),
+  **Hot files** with `changes with:` co-change partners, and branch
+  **ahead/behind** upstream in the header.
+- Recent commits: merges skipped, `+added/-deleted` totals, files ranked
+  by lines changed (the real change is no longer hidden in "+N more").
+- New **Other files** section (README, configs, pages; lockfiles and
+  minified files skipped); directory-grouped file tree.
+- New: `repoMap.managePointer: true` — the router maintains the one-line
+  CLAUDE.md pointer to the map: creates CLAUDE.md with a marked pointer
+  block (or uses the project's `.claude/CLAUDE.md`), appends to an
+  existing file, and refreshes a stale managed block in place;
+  a hand-written pointer (no marker) is recognized and left alone, and
+  symlinked CLAUDE.md files are skipped. Off by default; `POST
+  /map/refresh` and the `map` CLI report pointer status.
+- New knobs: `repoMap.exclude` (default fixtures/snapshots/testdata),
+  `git.historyDepth` (500), `fileTokens` budget for the code section
+  (default 6000) that sheds signatures → purposes → relations → symbols
+  → truncate (and says so); every section switchable with
+  `repoMap.detail.<name>=false`.
+- Fixed while reviewing real output: wrapped comments no longer produce
+  mid-sentence purposes; TODO detection no longer matches regexes or
+  prose; `entry` is not shown on test files; nested directories are
+  rendered as an indented tree; `POST /map/refresh` reports the generated
+  file's real size in file mode.
+- Tests: new `test/repomap-file-tests.js` (108 checks on Windows; more
+  on POSIX, where the symlink/permission checks run), added to
+  `npm test`.
+
 ## 1.8.5 (Repo map file mode)
 
 - **New: file mode for the repo map.** Set `repoMap.writeToFile` (e.g.

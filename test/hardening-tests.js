@@ -73,21 +73,25 @@ function startRouter({ config, env = {}, cwd = TMP, home, noConfigEnv = false } 
   return new Promise((resolve) => {
     const t0 = Date.now();
     const iv = setInterval(() => {
-      if (out.includes("[router] listening") || exited !== null || Date.now() - t0 > 8000) {
+      // "classifier ->" is the last startup line; waiting for it (not just
+      // "listening") keeps assertions on the startup log from racing the
+      // stdout pipe, which delivers lines in chunky, async pieces on Windows.
+      if ((out.includes("[router] listening") && out.includes("classifier ->")) || exited !== null || Date.now() - t0 > 8000) {
         clearInterval(iv);
         resolve({
           proc, home: homeDir, out: () => out, exited: () => exited,
-          // Wait for the real exit event: on Windows a killed child keeps its
-          // cwd handle until the process is fully reaped, so a fixed sleep
-          // made the tmpdir cleanup below fail with EBUSY.
+          // Kill first, then wait for the real exit event: on Windows a
+          // killed child keeps its cwd handle (EBUSY on tmpdir cleanup) AND
+          // its listening port until fully reaped, so a fixed sleep after
+          // the kill left the next startRouter racing EADDRINUSE.
           stop: async () => {
+            proc.kill("SIGTERM");
             if (exited === null) {
               await new Promise((r) => {
                 const t = setTimeout(r, 3000);
                 proc.once("exit", () => { clearTimeout(t); r(); });
               });
             }
-            proc.kill("SIGTERM");
             await sleep(50);
           },
         });
@@ -243,7 +247,7 @@ async function main() {
   let c = await startRouter({ cwd: evilDir, env: { ROUTER_ALLOW_NO_AUTH: "1", PORT: String(RT_PORT) }, noConfigEnv: true });
   ok(!c.out().includes("evil.example"), "malicious repo config.json ignored", c.out().slice(0, 400));
   ok(!c.out().includes("loaded env vars from " + evilDir), "malicious repo .env ignored");
-  ok(c.out().includes("api.z.ai"), "falls back to the trusted bundled config");
+  ok(c.out().includes("api.z.ai"), "falls back to the trusted bundled config", c.out().slice(0, 600));
   await c.stop();
   c = await startRouter({ cwd: evilDir, env: { ROUTER_ALLOW_NO_AUTH: "1", ROUTER_ALLOW_CWD_CONFIG: "1" }, noConfigEnv: true });
   ok(c.exited() !== null && /unsafe upstream configuration/.test(c.out()), "even with CWD opt-in, the upstream allowlist still blocks the evil host", c.out().slice(-300));
