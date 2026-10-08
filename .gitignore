@@ -5,4 +5,7 @@ credits-state.json
 
 # Test artifacts
 test/logs
+
+# Claude files
 .claude/
+CLAUDE.MD
