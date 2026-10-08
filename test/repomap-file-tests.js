@@ -340,6 +340,7 @@ async function main() {
     ok(new RegExp(`^big\\.js\\s+\\d+L 20\\d\\d-\\d\\d-\\d\\d ${h2}\\s`, "m").test(t), "per-file last commit: big.js -> the SECOND commit", bigLine.slice(0, 80));
     ok(/^a\.js\s+\d+L 20\d\d-\d\d-\d\d [0-9a-f]+\*/m.test(t), "uncommitted edits are flagged with *");
     ok(/^fresh\.js\s+\d+L new\b/m.test(t), "untracked files are flagged 'new'");
+    ok(/`NL` file length/.test(t) && !/`uses` = local files it imports/.test(t), "legend: no dead relations line when the tree has no import links");
     ok(/## Other files/.test(t) && /README\.md \d+L/.test(t) && /package\.json \d+L/.test(t) && /docs\/guide\.md/.test(t), "docs/config files are listed by name with line counts", t.split("## Other files")[1]);
     ok(!/package-lock\.json/.test(t), "lockfiles are not listed");
     ok(!/inFixture|fx\.js/.test(t), "fixtures are excluded by default pattern");
@@ -366,6 +367,10 @@ async function main() {
     w("pkg/core.py", 'def run():\n    """Run the core loop."""\n    import os\n    return os.environ.get("PY_MODE")\n');
     w("pkg/app.py", "from .core import run\nfrom . import util\n\ndef go():\n    return run()\n# FIXME: handle errors\n");
     w("test_core.py", "from pkg.core import run\n");
+    w(".github/workflows/ci.yml", "name: CI\non: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n");
+    // A file whose string literals embed sample source: the env var and the
+    // TODO inside the '...' string are data, not reads/tasks.
+    w("src/genie.js", "const tmpl = 'function gen() {\\n  return process.env.TEMPLATE_ONLY;\\n}\\n// TODO(fake): embedded in a string';\nfunction realOne() {\n  return process.env.REAL_ONE;\n}\n");
     git(p, "init", "-q"); git(p, "symbolic-ref", "HEAD", "refs/heads/main"); git(p, "add", "-A"); git(p, "commit", "-q", "-m", "init");
     for (let i = 0; i < 2; i++) { fs.appendFileSync(path.join(p, "src/index.js"), `// c${i}\n`); fs.appendFileSync(path.join(p, "src/util.js"), `// c${i}\n`); git(p, "add", "-A"); git(p, "commit", "-q", "-m", "change " + i); }
     const remote = path.join(TMP, "agent-remote.git"); spawnSync("git", ["init", "-q", "--bare", remote]);
@@ -377,6 +382,9 @@ async function main() {
     const t = fs.existsSync(MAPF(p)) ? rd(MAPF(p)) : "";
     const sect = (name) => ((t.split("## " + name)[1] || "").split("\n## ")[0]);
     ok(/Languages: .*JavaScript.*Python|Languages: .*Python.*JavaScript/.test(t) && /Package manager: npm/.test(t) && /Node: >=18/.test(t), "Project section: languages, package manager, node version", sect("Project"));
+    ok(/CI: GitHub Actions \(\.github\/workflows\/ci\.yml\)/.test(t), "Project section: CI evidence (provider + workflow file)", sect("Project"));
+    ok(/`NL` file length \| `date hash` last commit touching it \| `\*` uncommitted edits \| `new` untracked \| `entry` entry point \| `\[test\]` test file\./.test(t), "legend: the tree-markers line is always present");
+    ok(/`uses` = local files it imports \| `used by` = local importers \| `tests` = test files covering it\./.test(t), "legend: relations documented when the tree uses them");
     ok(/test: node test\/idx\.test\.js/.test(t) && /build: echo build/.test(t), "Commands: package.json scripts", sect("Commands"));
     ok(/Makefile targets: all, build, test/.test(t), "Commands: Makefile targets");
     ok(/entry: main=src\/index\.js; bin: demo=bin\/cli\.js/.test(t), "Commands: entry points from main/bin");
@@ -389,7 +397,8 @@ async function main() {
     ok(/main\(argv, opts\):\d+-\d+ - Entry point that wires everything together/.test(t), "signature + JSDoc purpose", (t.match(/main\(argv.*/) || [""])[0]);
     ok(/run\(mode\):\d+-\d+ - Shared utility functions for the app/.test(t), "signature + line-comment purpose");
     ok(/run\(\):\d+-\d+ - Run the core loop/.test(t), "Python docstring purpose");
-    ok(/## Environment variables read \(3;/.test(t) && /DEMO_MODE/.test(t) && /UTIL_FLAG/.test(t) && /PY_MODE/.test(t), "environment variables found (JS + Python)", sect("Environment variables read (3; file = where first read)"));
+    ok(/## Environment variables read \(4;/.test(t) && /DEMO_MODE/.test(t) && /UTIL_FLAG/.test(t) && /PY_MODE/.test(t) && /REAL_ONE/.test(t), "environment variables found (JS + Python), incl. a real read that shares a file with embedded fixture strings", sect("Environment variables read (4; file = where first read)"));
+    ok(!/TEMPLATE_ONLY/.test(t) && !/embedded in a string/.test(t), "env vars and TODOs inside string literals are not reported (fixture text embedded in tests stays out)", sect("Environment variables read (4; file = where first read)"));
     ok(/## TODO \/ FIXME markers \(2\)/.test(t) && /TODO: replace with a real CLI parser/.test(t) && /FIXME: handle errors/.test(t), "TODO/FIXME: the 2 real markers", sect("TODO / FIXME markers (2)"));
     ok(!/TODO markers are discussed|TODO\|FIXME/.test(t), "TODO/FIXME: prose and regex literals are not reported as tasks");
     ok(/src\/index\.js\s+\d+ commits.*changes with: .*src\/util\.js \(\d+\)/.test(t), "Hot files: 'changes with' co-change partner", sect("Hot files"));

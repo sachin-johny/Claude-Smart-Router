@@ -3,6 +3,33 @@
 All notable changes to `claude-smart-router` are documented here.
 See [README.md](README.md) for setup and usage.
 
+## 1.9.1 (Repo map accuracy)
+
+- Env-var and TODO extraction now tracks string-literal and comment spans:
+  text merely embedded in a file — fixture source inside a `'...'` string in
+  a test, an env var mentioned in a comment — is no longer reported as a
+  read or a task. Template literals still count (`${process.env.X}`
+  executes); TODO extraction skips only strings, since TODOs live in
+  comments.
+- The file walk no longer skips `.github`: workflow files appear in
+  **Other files**, and the Project section's CI evidence lists them —
+  `CI: GitHub Actions (.github/workflows/ci.yml, ...)` (up to 4) — instead
+  of claiming a CI exists with no way to find it.
+- The relations legend line (`uses` / `used by` / `tests`) is emitted only
+  when the tree actually contains relations — repos without import links
+  no longer carry a dead legend line.
+- `managePointer`: the CLAUDE.md pointer is written before the git-status
+  snapshot, so a freshly created/updated CLAUDE.md is reflected in the
+  map's Uncommitted section immediately (one-shot `map` runs have no
+  watcher to self-heal later); pointer status comes back from the same
+  `regenerateMapFile` pass for startup, `POST /map/refresh` and the `map`
+  CLI.
+- The staleness hint now states the actual check (the hash after `@` must
+  be a prefix of `git rev-parse HEAD`).
+- Tests: a fixture file pairing a real `process.env` read with embedded
+  fake text, plus CI-evidence and legend assertions (113 checks in
+  `test/repomap-file-tests.js`).
+
 ## 1.9.0 (Repo map rewritten for agents)
 
 The file-mode map is no longer a bare tree — it is an orientation document
