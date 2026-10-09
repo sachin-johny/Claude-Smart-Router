@@ -3,6 +3,34 @@
 All notable changes to `claude-smart-router` are documented here.
 See [README.md](README.md) for setup and usage.
 
+## 1.9.2 (Interpolation-aware spans, pointer safeguards)
+
+- Env-var and TODO extraction now understands template literals and Python
+  f-strings: inside a template only `${...}` counts as code (an env read in
+  a URL template's host segment is reported; the template's own text — on
+  the opening line or a continuation line — stays data), and an f-string
+  reports its `{...}` interpolations while plain strings stay data. A match
+  starting exactly at a span edge is outside for comments (a `// TODO:` at
+  column 0 is still reported) but inside for strings (continuation-line
+  text is data).
+- `managePointer` safety: the CLAUDE.md pointer is no longer written
+  through a symlinked `.claude` (or other parent) directory — candidates
+  whose realpath resolves outside the project root are skipped with a log
+  line — and pointer creation is skipped entirely when an AGENTS.md exists
+  and no CLAUDE.local.md does (a CLAUDE.md would shadow the team's
+  AGENTS.md for Claude Code).
+- The pointer block and the startup tip both gain a usage sentence: use
+  the map's line ranges with Read offset/limit instead of reading whole
+  files.
+- Config validation: `repoMap.writeToFile` must not contain control
+  characters (it is quoted into CLAUDE.md).
+- The HTTP server wraps request handling in a catch: a bug in one handler
+  now logs and answers 500 JSON instead of crashing the whole proxy with
+  an unhandled rejection.
+- Tests: template/f-string/multiline span extraction, TODO-inside-template,
+  AGENTS.md skip (with and without CLAUDE.local.md), and symlinked-.claude
+  pointer skip (120 checks in `test/repomap-file-tests.js`).
+
 ## 1.9.1 (Repo map accuracy)
 
 - Env-var and TODO extraction now tracks string-literal and comment spans:

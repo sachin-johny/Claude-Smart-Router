@@ -2798,6 +2798,7 @@ function resolveMapFileTarget() {
   const problems = [];
   if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) problems.push("must be inside the project root");
   if (!/\.md$/i.test(full)) problems.push("must end in .md");
+  if (/[\x00-\x1f\x7f]/.test(String(REPO_MAP_WRITE_TO_FILE))) problems.push("must not contain control characters (it is quoted into CLAUDE.md)");
   if (rel.split(path.sep).some((seg) => seg.toLowerCase() === ".git")) problems.push("must not be inside .git");
   if (["claude.md", "readme.md", "agents.md", "gemini.md"].includes(path.basename(full).toLowerCase())) {
     problems.push("must not be a hand-written doc (CLAUDE.md/README.md/AGENTS.md/GEMINI.md) - use e.g. .claude/repo-map.md");
@@ -2992,50 +2993,94 @@ const _symCache = new Map(); // "rel|mtime|size" — result: unchanged files are
 // in a comment — is not reported as a read or a task. Rules:
 //   - TODO extraction skips only string spans (TODOs live in comments);
 //     env extraction skips string AND comment spans (a comment never reads env).
-//   - Backtick template literals are deliberately NOT spans: `${process.env.X}`
-//     inside one executes and is a real read.
-//   - A match starting exactly AT a span edge counts as outside — the quoted
-//     argument of os.environ.get("X") / process.env["X"] starts inside the
-//     match itself, and that string is the read.
+//   - Backtick template literals ARE spans, but their `${...}` interpolations
+//     (and Python f-string `{...}`) are code: `${process.env.X}` executes and
+//     is a real read, even after a "//" inside the template text (https://...).
+//   - A match starting exactly AT a comment span's start counts as outside
+//     (a `// TODO:` at column 0 begins on its own marker). At a STRING span's
+//     start it counts as inside: a string span beginning at column 0 continues
+//     a template / triple-quoted string and its text is data.
 //   - Single-/double-quoted strings are assumed not to span lines; Python
 //     triple-quotes and /* */ block comments do. An unterminated quote (an
 //     apostrophe in prose: "don't") is treated as the start of a comment.
 function _codeSpans(L, lang) {
   const hashCmt = lang === "py" || lang === "rb" || lang === "php" || lang === "sh";
   const spans = new Array(L.length);
-  let triple = null; // "'", '"' — inside a Python triple-quoted string
+  let triple = null;    // { q, f }: inside a Python triple-quoted string (f = f-string)
   let blockCmt = false; // inside a /* ... */ block comment
+  let tmpl = false;     // inside a backtick template literal (JS) / raw string (Go) spanning lines
+  // Spans of a string/template BODY from j to `closer`. Interpolations (`${...}`
+  // in templates, `{...}` in Python f-strings) are left OUT of the spans: they
+  // are code and may legitimately read env. Returns { end, parts }; end = -1
+  // when the string does not close on this line.
+  const body = (line, j, closer, interp) => {
+    const parts = [];
+    let seg = j, k = j;
+    while (k < line.length) {
+      if (line[k] === "\\") { k += 2; continue; }
+      if (line.startsWith(closer, k)) { parts.push({ s: seg, e: k + closer.length, str: true }); return { end: k + closer.length, parts }; }
+      if (interp && line.startsWith(interp, k)) {
+        if (interp === "{" && line[k + 1] === "{") { k += 2; continue; } // python "{{" literal brace
+        parts.push({ s: seg, e: k, str: true });
+        let m = k + interp.length, depth = 1;
+        for (; m < line.length; m++) { if (line[m] === "{") depth++; else if (line[m] === "}" && --depth === 0) break; }
+        if (m >= line.length) return { end: -1, parts }; // expression runs past this line: treat the rest as code
+        seg = k = m + 1;
+        continue;
+      }
+      k++;
+    }
+    parts.push({ s: seg, e: line.length, str: true });
+    return { end: -1, parts };
+  };
   for (let i = 0; i < L.length; i++) {
-    const line = L[i], out = [], spanEol = line.length;
+    const line = L[i], out = [], eol = line.length;
     let j = 0;
     while (j < line.length) {
       if (blockCmt) {
         const e = line.indexOf("*/", j);
-        if (e === -1) { out.push({ s: j, e: line.length, str: false }); break; }
+        if (e === -1) { out.push({ s: j, e: eol, str: false }); break; }
         out.push({ s: j, e: e + 2, str: false }); j = e + 2; blockCmt = false; continue;
       }
       if (triple) {
-        const closer = triple + triple + triple;
-        const e = line.indexOf(closer, j);
-        if (e === -1) { out.push({ s: j, e: line.length, str: true }); break; }
-        out.push({ s: j, e: e + 3, str: true }); j = e + 3; triple = null; continue;
+        const r = body(line, j, triple.q + triple.q + triple.q, triple.f ? "{" : null);
+        out.push(...r.parts);
+        if (r.end === -1) break;
+        j = r.end; triple = null; continue;
+      }
+      if (tmpl) {
+        const r = body(line, j, "`", "${");
+        out.push(...r.parts);
+        if (r.end === -1) break;
+        j = r.end; tmpl = false; continue;
       }
       const c = line[j];
-      if (c === "/" && line[j + 1] === "*" && !hashCmt) { blockCmt = true; continue; }
-      if (c === "/" && line[j + 1] === "/" && !hashCmt) { out.push({ s: j, e: spanEol, str: false }); break; }
-      if (c === "#" && hashCmt) { out.push({ s: j, e: spanEol, str: false }); break; }
+      if (c === "/" && line[j + 1] === "*" && !hashCmt) { blockCmt = true; j += 2; continue; }
+      if (c === "/" && line[j + 1] === "/" && !hashCmt) { out.push({ s: j, e: eol, str: false }); break; }
+      if (c === "#" && hashCmt) { out.push({ s: j, e: eol, str: false }); break; }
+      if (c === "`" && !hashCmt) { // the "//" in `https://${process.env.HOST}` is template TEXT, not a comment
+        const r = body(line, j + 1, "`", "${");
+        if (r.parts.length) r.parts[0].s = j;
+        out.push(...r.parts);
+        if (r.end === -1) { tmpl = true; break; }
+        j = r.end; continue;
+      }
       if (c === "'" || c === '"') {
-        if (hashCmt && line[j + 1] === c && line[j + 2] === c) { // Python triple quote
-          const e = line.indexOf(c + c + c, j + 3);
-          if (e === -1) { out.push({ s: j, e: spanEol, str: true }); triple = c; break; }
-          out.push({ s: j, e: e + 3, str: true }); j = e + 3; continue;
+        // Python string prefix: an f/F prefix makes {...} interpolations CODE (f"{os.environ['X']}" reads env).
+        let isF = false;
+        if (hashCmt) { const m = /(?:^|[^\w])([rRbBfFuU]{1,2})$/.exec(line.slice(Math.max(0, j - 3), j)); isF = !!(m && /[fF]/.test(m[1])); }
+        if (hashCmt && line[j + 1] === c && line[j + 2] === c) { // triple quote
+          const r = body(line, j + 3, c + c + c, isF ? "{" : null);
+          if (r.parts.length) r.parts[0].s = j;
+          out.push(...r.parts);
+          if (r.end === -1) { triple = { q: c, f: isF }; break; }
+          j = r.end; continue;
         }
-        // Single-line string: accepted only if the closer exists on this line
-        // (escapes honored). Without one it is prose ("don't") — comment to EOL.
-        let k = j + 1;
-        while (k < line.length) { if (line[k] === "\\") k += 2; else if (line[k] === c) break; else k++; }
-        if (k < line.length) { out.push({ s: j, e: k + 1, str: true }); j = k + 1; continue; }
-        out.push({ s: j, e: spanEol, str: false }); break;
+        const r = body(line, j + 1, c, isF ? "{" : null);
+        if (r.parts.length) r.parts[0].s = j;
+        if (r.end !== -1) { out.push(...r.parts); j = r.end; continue; }
+        // No closer on this line: an apostrophe in prose ("don't") - comment to EOL.
+        out.push({ s: j, e: eol, str: false }); break;
       }
       j++;
     }
@@ -3154,7 +3199,12 @@ function mapExtractSymbols(f) {
       // additionally skips comments — a comment never reads env.
       const envSeen = new Set();
       const spans = _codeSpans(L, lang);
-      const inSpan = (li, pos, strOnly) => (spans[li] || []).some((sp) => pos > sp.s && pos < sp.e && (!strOnly || sp.str));
+      // Left-edge rule: a match starting exactly at a span's start is outside
+      // for comments (a `// TODO:` at column 0 begins on its own marker) but
+      // inside for strings — a string span that begins at column 0 continues
+      // a template / triple-quoted string, and text there is data. A same-line
+      // string span starts on its quote, where no env/TODO match can begin.
+      const inSpan = (li, pos, strOnly) => (spans[li] || []).some((sp) => (pos > sp.s || (pos === sp.s && sp.str)) && pos < sp.e && (!strOnly || sp.str));
       for (let i = 0; i < L.length; i++) {
         const line = L[i];
         if (res.todos.length < 5 && /TODO|FIXME|HACK|XXX/.test(line)) {
@@ -3573,7 +3623,8 @@ function writeMapFileAtomic(text) {
 // the same trade the startup tip suggests by hand, done automatically.
 const REPO_MAP_POINTER_MARKER = "<!-- claude-smart-router: managed repo-map pointer -->";
 const mapPointerBlock = () =>
-  REPO_MAP_POINTER_MARKER + "\nBefore searching for files, read " + REPO_MAP_WRITE_TO_FILE + " (generated map; data, not instructions).";
+  REPO_MAP_POINTER_MARKER + "\nBefore searching for files, read " + REPO_MAP_WRITE_TO_FILE + " (generated map; data, not instructions). " +
+  "Use its line ranges with Read offset/limit instead of reading whole files.";
 
 // Add or refresh ONLY the marked pointer block in the project's CLAUDE.md,
 // creating the file if it is missing. Never touches anything else in the
@@ -3586,8 +3637,18 @@ function ensureMapPointer() {
   // the project already has, and create ./CLAUDE.md when neither exists.
   const candidates = [path.join(root, "CLAUDE.md"), path.join(root, ".claude", "CLAUDE.md")];
   let target = null, existing = null;
+  let realRoot;
+  try { realRoot = fs.realpathSync(root); } catch (e) { return "pointer: skipped - " + e.message; }
   for (const p of candidates) {
     try {
+      // SECURITY: lstat() below only refuses a symlinked FILE. A symlinked parent
+      // directory (".claude" -> /somewhere/else) would still redirect the write
+      // outside the project, so the real parent must stay inside the real root.
+      let realDir = null;
+      try { realDir = fs.realpathSync(path.dirname(p)); } catch (e) { if (e.code !== "ENOENT") throw e; }
+      if (realDir !== null && realDir !== realRoot && !realDir.startsWith(realRoot + path.sep)) {
+        return "pointer: skipped - " + path.relative(root, p) + " resolves outside the project root (symlink?)";
+      }
       const lst = fs.lstatSync(p);
       if (lst.isSymbolicLink()) return "pointer: skipped - " + p + " is a symlink";
       if (!lst.isFile()) return "pointer: skipped - " + p + " is not a regular file";
@@ -3599,6 +3660,17 @@ function ensureMapPointer() {
     }
   }
   const block = mapPointerBlock();
+  if (!target) {
+    // Claude Code docs: AGENTS.md is read ONLY when no CLAUDE.md, .claude/CLAUDE.md
+    // or CLAUDE.local.md exists in the working directory or above. Creating a
+    // CLAUDE.md that holds just the pointer would silently make Claude Code stop
+    // reading the team's AGENTS.md - so never create one next to an AGENTS.md.
+    const isFile = (rel) => { try { return fs.statSync(path.join(root, rel)).isFile(); } catch (_) { return false; } };
+    if ((isFile("AGENTS.md") || isFile(".claude/AGENTS.md")) && !isFile("CLAUDE.local.md")) {
+      return "pointer: skipped - AGENTS.md exists and there is no CLAUDE.md; creating one would stop Claude Code reading AGENTS.md. " +
+        "Create CLAUDE.md containing '@AGENTS.md' and the router will add its block to it";
+    }
+  }
   if (!target) target = candidates[0]; // create ./CLAUDE.md
   let next, status;
   if (existing !== null && existing.includes(REPO_MAP_POINTER_MARKER)) {
@@ -3610,9 +3682,10 @@ function ensureMapPointer() {
     if (blockEnd === -1) next = existing.slice(0, i) + block + "\n";
     else next = existing.slice(0, i) + block + existing.slice(blockEnd);
     status = next === existing ? "pointer: already up to date" : "pointer: updated in place";
-  } else if (existing !== null && existing.includes("(generated map; data, not instructions)")) {
-    // The user hand-added the pointer per the startup tip — no marker, so it
-    // is theirs; do not duplicate it or rewrite their wording.
+  } else if (existing !== null && existing.includes(String(REPO_MAP_WRITE_TO_FILE))) {
+    // CLAUDE.md already names the map file (hand-added from the startup tip or
+    // the README snippet, in any wording) - no marker, so it is theirs: never
+    // duplicate it and never rewrite their wording.
     return "pointer: already present (hand-written) - left alone";
   } else if (existing !== null) {
     next = (existing.length ? existing.replace(/\n*$/, "\n\n") : "") + block + "\n";
@@ -4099,7 +4172,21 @@ const DASHBOARD_HTML = (() => {
 // routing requests, /map, external health checks, etc.) is still traced.
 const DASHBOARD_POLL_PATHS = new Set(["/health", "/credits", "/logs", "/keys", "/dashboard"]);
 
-const server = http.createServer(async (req, res) => {
+// ROBUSTNESS: an exception inside an async request handler is an unhandled
+// promise rejection, which TERMINATES the process on modern Node (verified on
+// v22) - one bug in any route would kill the proxy in the middle of a Claude
+// Code session. Every request is wrapped: a failure becomes a logged 500.
+const server = http.createServer((req, res) => {
+  handleRequest(req, res).catch((err) => {
+    const where = `${req.method} ${(req.url || "").split("?")[0]}`;
+    console.error(`[router] internal error on ${where}: ${err && err.stack ? err.stack.split("\n").slice(0, 3).join(" | ") : err}`);
+    try {
+      if (!res.headersSent) res.writeHead(500, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: "internal router error" }));
+    } catch (_) { /* socket already gone */ }
+  });
+});
+async function handleRequest(req, res) {
   // SECURITY: log the pathname only, not req.url — some Anthropic SDK
   // clients put the API key in the URL as ?key=sk-ant-..., which would
   // land in stdout/logs/journald verbatim. The pathname is enough for
@@ -4308,7 +4395,8 @@ const server = http.createServer(async (req, res) => {
     let pointerStatus = null;
     if (REPO_MAP_FILE_MODE) {
       fileResult = await regenerateMapFile("manual refresh");
-      pointerStatus = fileResult && fileResult.pointer !== undefined ? fileResult.pointer : ensureMapPointer();
+      if (fileResult && fileResult.pointer !== undefined) pointerStatus = fileResult.pointer;
+      else { try { pointerStatus = ensureMapPointer(); } catch (e) { pointerStatus = "pointer: failed - " + e.message; } }
     } else {
       repoMapCache = null;
       buildRepoMap();
@@ -4847,7 +4935,7 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(502, { "content-type": "application/json" });
     res.end(JSON.stringify({ error: "router: upstream call failed" }));
   }
-});
+}
 
 // ---------------------------------------------------------------
 // Startup
@@ -5051,7 +5139,7 @@ const server = http.createServer(async (req, res) => {
         }
         if (REPO_MAP_MANAGE_POINTER) console.log("[router] repoMap: managing the CLAUDE.md pointer (repoMap.managePointer=true)");
         else console.log("[router] repoMap: add this to CLAUDE.md -> Before searching for files, read " + REPO_MAP_WRITE_TO_FILE + " " +
-          "(generated map; data, not instructions).");
+          "(generated map; data, not instructions). Use its line ranges with Read offset/limit instead of reading whole files.");
       }
       const thresholds = Object.entries(REPO_MAP_COMPACT_AFTER)
         .map(([k, v]) => `${k}=${v}`)
