@@ -354,6 +354,23 @@ async function main() {
       ok(/pointer: skipped/.test(r.out()) && /outside the project root/.test(r.out()), "and the router says why", r.out().slice(-300));
       await r.stop();
     }
+    {
+      // Companion: when the map itself writes to root (succeeds), ensureMapPointer()
+      // directly hits its own symlinked-.claude refusal.
+      const p2 = mkProj("symdir-ptr-direct"); const outside2 = fs.mkdtempSync(path.join(TMP, "outside-"));
+      fs.writeFileSync(path.join(p2, "a.js"), "function a() {}\n");
+      fs.symlinkSync(outside2, path.join(p2, ".claude"));
+      const r2 = await startRouter({ config: cfg(p2, { writeToFile: "repo-map.md", managePointer: true }) });
+      await sleep(1500);
+      ok(
+        fs.existsSync(path.join(p2, "repo-map.md")) &&
+        fs.readdirSync(outside2).length === 0 &&
+        !fs.existsSync(path.join(p2, "CLAUDE.md")),
+        "ensureMapPointer refuses symlinked .claude even when map write succeeds in root"
+      );
+      ok(/pointer: skipped - .*outside the project root/.test(r2.out()), "ensureMapPointer logs outside the project root", r2.out().slice(-300));
+      await r2.stop();
+    }
   }
 
   // ================= spans: template literals and f-strings =================

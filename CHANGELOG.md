@@ -3,6 +3,12 @@
 All notable changes to `claude-smart-router` are documented here.
 See [README.md](README.md) for setup and usage.
 
+## 1.9.5 (Pointer skip status on failed map write)
+
+- Fix: report `pointer: skipped - map write failed (...)` when map writing throws before `ensureMapPointer()` runs (such as when `.claude` is symlinked outside the project root).
+- Fix: gate `mapWatchTick()`'s missing-file regeneration on `writtenFp !== null` so projects where no map was ever written do not re-trigger on every watch tick.
+- Tests: added direct symlinked-`.claude` test coverage (`symdir-ptr-direct`) in `test/repomap-file-tests.js`.
+
 ## 1.9.4 (Pointer ordering, missing-map recovery)
 
 - Fix: `managePointer` could create `CLAUDE.md` while no map existed (project with no
