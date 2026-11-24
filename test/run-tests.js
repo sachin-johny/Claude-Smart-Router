@@ -231,6 +231,16 @@ function setReply(v) {
 function setTierStatus(v) {
   fs.writeFileSync(path.join(LOG_DIR, "TIER_STATUS"), String(v));
 }
+function setTierStatusByModel(obj) {
+  const p = path.join(LOG_DIR, "TIER_STATUS_BY_MODEL");
+  if (obj === null) fs.rmSync(p, { force: true });
+  else fs.writeFileSync(p, JSON.stringify(obj));
+}
+function setTierReplyByModel(obj) {
+  const p = path.join(LOG_DIR, "TIER_REPLY_BY_MODEL");
+  if (obj === null) fs.rmSync(p, { force: true });
+  else fs.writeFileSync(p, JSON.stringify(obj));
+}
 // Resilience-test controls. setClassifierFail writes a countdown: the
 // mock fails the next N classifier calls then resumes healthy replies.
 // status defaults to 429; retryAfter (seconds) is sent as Retry-After.
@@ -1828,14 +1838,21 @@ async function runTests() {
     await startRouter(p, { ROUTES_PATH: NO_ROUTES });
     clearLog();
     setReply(JSON.stringify({ complexity: "medium", clarity: "clear", assumptions: [] }));
-    // Mock the tier-medium backend to return a LONG reply containing
-    // "I cannot complete this task" — but with enough surrounding text
-    // to be a legitimate refusal, not a failure.
-    // We can't easily make the mock return different content per call,
-    // so we just verify the existing tests still pass with the tightened
-    // patterns. This test is a placeholder that confirms the suite runs.
-    ok(true, "FAILURE_PATTERNS tightened; long replies with failure phrases don't escalate");
-    await stopRouter();
+    const longReply = "I cannot complete this task until you provide the missing schema. " +
+      "However, here is a detailed sketch of how the module is structured. ".repeat(8);
+    setTierReplyByModel({ "tier-medium": longReply });
+    try {
+      const r = await post("/v1/messages", msgBody({
+        messages: [{ role: "user", content: "implement Q5 refusal check" }],
+      }));
+      eq(r.status, 200, "Q5 returns 200");
+      eq(chatCalls().length, 1, "long reply containing failure phrase does not escalate (1 chat call)");
+      eq(chatCalls()[0].model, "tier-medium", "stayed on tier-medium");
+    } finally {
+      setTierReplyByModel(null);
+      setTierStatus(200);
+      await stopRouter();
+    }
   });
 
   await test("Q9: .env parser strips inline comments", async () => {
@@ -2719,6 +2736,111 @@ async function runTests() {
       else process.env.DEBUG = savedDebug;
     }
     await stopRouter();
+  });
+
+  await test("E1: non-stream 5xx escalates from medium to hard", async () => {
+    const cfg = buildConfig();
+    const p = path.join(LOG_DIR, "config-esc-e1.json");
+    fs.writeFileSync(p, JSON.stringify(cfg));
+    await startRouter(p, { ROUTES_PATH: NO_ROUTES });
+    setReply(JSON.stringify({ complexity: "medium", clarity: "clear", assumptions: [] }));
+    clearLog();
+    setTierStatusByModel({ "tier-medium": 503 });
+    try {
+      const r = await post("/v1/messages", msgBody({
+        messages: [{ role: "user", content: "E1 non-stream 5xx escalation" }],
+      }));
+      eq(r.status, 200, "E1 returns 200 from escalated tier");
+      ok(r.text.includes("reply-from-tier-hard"), "E1 response comes from tier-hard");
+      eq(
+        JSON.stringify(chatCalls().map((c) => c.model)),
+        JSON.stringify(["tier-medium", "tier-hard"]),
+        "E1 called tier-medium then tier-hard"
+      );
+    } finally {
+      setTierStatusByModel(null);
+      setTierStatus(200);
+      await stopRouter();
+    }
+  });
+
+  await test("E2: stream 5xx escalates from medium to hard", async () => {
+    const cfg = buildConfig();
+    const p = path.join(LOG_DIR, "config-esc-e2.json");
+    fs.writeFileSync(p, JSON.stringify(cfg));
+    await startRouter(p, { ROUTES_PATH: NO_ROUTES });
+    setReply(JSON.stringify({ complexity: "medium", clarity: "clear", assumptions: [] }));
+    clearLog();
+    setTierStatusByModel({ "tier-medium": 503 });
+    try {
+      const r = await post("/v1/messages", msgBody({
+        messages: [{ role: "user", content: "E2 stream 5xx escalation" }],
+        stream: true,
+      }));
+      eq(r.status, 200, "E2 returns 200 from escalated tier");
+      ok(r.text.includes("reply-from-tier-hard"), "E2 stream response comes from tier-hard");
+      ok((r.headers.get("content-type") || "").includes("event-stream"), "E2 preserves event-stream content-type");
+      eq(
+        JSON.stringify(chatCalls().map((c) => c.model)),
+        JSON.stringify(["tier-medium", "tier-hard"]),
+        "E2 called tier-medium then tier-hard"
+      );
+    } finally {
+      setTierStatusByModel(null);
+      setTierStatus(200);
+      await stopRouter();
+    }
+  });
+
+  await test("E3: escalation cap limits to 1 per session", async () => {
+    const cfg = buildConfig();
+    const p = path.join(LOG_DIR, "config-esc-e3.json");
+    fs.writeFileSync(p, JSON.stringify(cfg));
+    await startRouter(p, { ROUTES_PATH: NO_ROUTES });
+    setReply(JSON.stringify({ complexity: "medium", clarity: "clear", assumptions: [] }));
+    clearLog();
+    setTierStatusByModel({ "tier-medium": 503, "tier-hard": 503 });
+    try {
+      const body = msgBody({
+        messages: [{ role: "user", content: "E3 escalation cap test" }],
+      });
+      const r1 = await post("/v1/messages", body);
+      eq(r1.status, 503, "E3 1st request returns 503 when both tiers fail");
+      eq(chatCalls().length, 2, "E3 1st request makes 2 chat calls");
+      const r2 = await post("/v1/messages", body);
+      eq(r2.status, 503, "E3 2nd request returns 503 without escalating");
+      eq(chatCalls().length, 3, "E3 2nd request makes 1 more chat call (total 3)");
+    } finally {
+      setTierStatusByModel(null);
+      setTierStatus(200);
+      await stopRouter();
+    }
+  });
+
+  await test("E4: failure pattern on non-stream 200 escalates from medium to hard", async () => {
+    const cfg = buildConfig();
+    const p = path.join(LOG_DIR, "config-esc-e4.json");
+    fs.writeFileSync(p, JSON.stringify(cfg));
+    await startRouter(p, { ROUTES_PATH: NO_ROUTES });
+    setReply(JSON.stringify({ complexity: "medium", clarity: "clear", assumptions: [] }));
+    clearLog();
+    setTierReplyByModel({ "tier-medium": "Error: malformed tool_use" });
+    try {
+      const r = await post("/v1/messages", msgBody({
+        messages: [{ role: "user", content: "E4 failure pattern escalation" }],
+      }));
+      eq(r.status, 200, "E4 returns 200");
+      ok(r.text.includes("reply-from-tier-hard"), "E4 response comes from tier-hard");
+      eq(
+        JSON.stringify(chatCalls().map((c) => c.model)),
+        JSON.stringify(["tier-medium", "tier-hard"]),
+        "E4 called tier-medium then tier-hard"
+      );
+    } finally {
+      setTierReplyByModel(null);
+      setTierStatus(200);
+      await stopRouter();
+    }
   });
 
   await stopRouter();

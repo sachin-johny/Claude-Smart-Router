@@ -144,7 +144,20 @@ function makeAnthropicServer() {
     }
 
     if (req.url === "/v1/messages") {
-      const status = parseInt(readControl("TIER_STATUS", "200"), 10);
+      let status = parseInt(readControl("TIER_STATUS", "200"), 10);
+      try {
+        const byModel = JSON.parse(readControl("TIER_STATUS_BY_MODEL", "null"));
+        if (byModel && typeof byModel === "object" && body.model in byModel) {
+          status = parseInt(byModel[body.model], 10);
+        }
+      } catch (_) {}
+      let replyText = `reply-from-${body.model}`;
+      try {
+        const replyByModel = JSON.parse(readControl("TIER_REPLY_BY_MODEL", "null"));
+        if (replyByModel && typeof replyByModel === "object" && body.model in replyByModel) {
+          replyText = String(replyByModel[body.model]);
+        }
+      } catch (_) {}
       if (body.stream) {
         res.writeHead(status, { "content-type": "text/event-stream" });
         // Usage-bearing events shaped like the real Messages API, so the
@@ -162,7 +175,7 @@ function makeAnthropicServer() {
         res.write(
           `data: ${JSON.stringify({
             type: "content_block_delta",
-            delta: { type: "text_delta", text: `reply-from-${body.model}` },
+            delta: { type: "text_delta", text: replyText },
           })}\n\n`
         );
         res.write(
@@ -182,7 +195,7 @@ function makeAnthropicServer() {
             type: "message",
             role: "assistant",
             model: body.model,
-            content: [{ type: "text", text: `reply-from-${body.model}` }],
+            content: [{ type: "text", text: replyText }],
             stop_reason: "end_turn",
             usage: { input_tokens: 100, output_tokens: 50 },
           })

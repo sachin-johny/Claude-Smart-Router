@@ -3,6 +3,12 @@
 All notable changes to `claude-smart-router` are documented here.
 See [README.md](README.md) for setup and usage.
 
+## 1.9.3 (Streaming 5xx escalation, repo-map module)
+
+- Deduplicated auto-escalation into a shared `tryEscalate` / `sendUpstream` flow in `router.js` and enabled HTTP 5xx escalation for streaming requests as well as non-streaming requests.
+- Extracted the repo-map subsystem out of `router.js` into [`lib/repo-map.js`](lib/repo-map.js) and included `lib/` in `package.json` `files`.
+- Tests: added escalation coverage (`E1`–`E4`) and replaced placeholder `Q5` in `test/run-tests.js` (317 checks).
+
 ## 1.9.2 (Interpolation-aware spans, pointer safeguards)
 
 - Env-var and TODO extraction now understands template literals and Python
