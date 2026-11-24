@@ -3,6 +3,20 @@
 All notable changes to `claude-smart-router` are documented here.
 See [README.md](README.md) for setup and usage.
 
+## 1.9.4 (Pointer ordering, missing-map recovery)
+
+- Fix: `managePointer` could create `CLAUDE.md` while no map existed (project with no
+  source files, or a refused/failed map write) because the pointer was written first.
+  The map is now written first and the pointer only after it; if the pointer changed
+  `CLAUDE.md`, the map is rebuilt once so its Uncommitted section stays accurate. With no
+  source files the pointer is reported as `not written - no map was generated`.
+- Fix: the watcher now regenerates the map when the map file itself is deleted
+  (`git clean`, manual `rm`), instead of leaving `CLAUDE.md` pointing at a missing file.
+- The managed pointer now ends with "If the file is missing, skip it and search normally."
+  Existing blocks are updated in place on the next run.
+- Tests: no-source-files (no pointer), deleted-map regeneration (123 checks in
+  `test/repomap-file-tests.js`).
+
 ## 1.9.3 (Streaming 5xx escalation, repo-map module)
 
 - Deduplicated auto-escalation into a shared `tryEscalate` / `sendUpstream` flow in `router.js` and enabled HTTP 5xx escalation for streaming requests as well as non-streaming requests.
